@@ -2,7 +2,7 @@ import enum
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, String, Text, UniqueConstraint, BigInteger
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -106,9 +106,9 @@ class RemoteConfig(Base):
     client_sub_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
     client_enable: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     client_expiry_time: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    client_total_gb: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    client_up: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    client_down: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    client_total_gb: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    client_up: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    client_down: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     raw_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[RemoteConfigStatus] = mapped_column(Enum(RemoteConfigStatus), default=RemoteConfigStatus.active)
     discovered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)

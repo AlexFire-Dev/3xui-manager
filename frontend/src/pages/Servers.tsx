@@ -11,6 +11,7 @@ export function ServersPage({ servers, onChanged }: { servers: Server[]; onChang
   const [q, setQ] = React.useState('');
   const [error, setError] = React.useState<string | null>(null);
   const [busy, setBusy] = React.useState<string | null>(null);
+  const [editing, setEditing] = React.useState<Server | null>(null);
 
   async function loadConfigs(server: Server, query = q) {
     setSelected(server); setBusy('configs'); setError(null);
@@ -41,9 +42,26 @@ export function ServersPage({ servers, onChanged }: { servers: Server[]; onChang
   return <div className="page-grid two-col">
     <div>
       <CreateServerForm onCreate={async payload => { await api.createServer(payload); await onChanged(); }} />
+      {editing && (
+        <CreateServerForm
+          initial={editing}
+          title={`Edit server: ${editing.name}`}
+          submitLabel="Save"
+          onCancel={() => setEditing(null)}
+          onCreate={async payload => {
+            const cleanPayload = {
+              ...payload,
+              panel_password: payload.panel_password || undefined,
+            };
+            await api.patchServer(editing.id, cleanPayload);
+            setEditing(null);
+            await onChanged();
+          }}
+        />
+      )}
       <Card title="Servers"><ErrorBox error={error} />{servers.length === 0 ? <Empty>Add your first 3x-ui server.</Empty> : <div className="table-wrap"><table><thead><tr><th>Name</th><th>Status</th><th>Panel</th><th>Last refresh</th><th /></tr></thead><tbody>{servers.map(server => <tr key={server.id} className={selected?.id === server.id ? 'selected-row' : ''}>
         <td><b>{server.name}</b><small>{shortId(server.id)}</small></td><td><Badge value={server.status} /></td><td>{server.panel_url}</td><td>{fmtDate(server.last_config_refresh_at)}</td>
-        <td className="row-actions"><Button variant="secondary" busy={busy === server.id} onClick={() => health(server)}>Health</Button><Button variant="secondary" busy={busy === server.id} onClick={() => refresh(server)}>Refresh configs</Button><Button variant="ghost" onClick={() => loadConfigs(server)}>Open</Button><Button variant="danger" busy={busy === `delete-${server.id}`} onClick={() => removeServer(server)}>Delete</Button></td>
+        <td className="row-actions"><Button variant="secondary" busy={busy === server.id} onClick={() => health(server)}>Health</Button><Button variant="secondary" busy={busy === server.id} onClick={() => refresh(server)}>Refresh configs</Button><Button variant="ghost" onClick={() => loadConfigs(server)}>Open</Button><Button variant="secondary" onClick={() => setEditing(server)}>Edit</Button><Button variant="danger" busy={busy === `delete-${server.id}`} onClick={() => removeServer(server)}>Delete</Button></td>
       </tr>)}</tbody></table></div>}</Card>
     </div>
     <Card title={selected ? `Configs: ${selected.name}` : 'Configs'} action={selected && <div className="inline-tools"><Input placeholder="Search" value={q} onChange={e => setQ(e.target.value)} /><Button variant="secondary" onClick={() => selected && loadConfigs(selected, q)}>Search</Button></div>}>

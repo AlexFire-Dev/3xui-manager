@@ -67,6 +67,15 @@ class ServerCreate(BaseModel):
     subscription_base_url: HttpUrl = Field(description="Base URL for 3x-ui subscription endpoint, e.g. https://xui.example.com/sub")
 
 
+class ServerUpdate(BaseModel):
+    name: str | None = None
+    panel_url: HttpUrl | None = None
+    panel_username: str | None = None
+    panel_password: str | None = None
+    subscription_base_url: HttpUrl | None = None
+    status: ServerStatus | None = None
+
+
 class ServerRead(BaseModel):
     id: str
     name: str

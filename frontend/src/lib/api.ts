@@ -76,6 +76,20 @@ export const api = {
   userSubscriptions: (id: string) => request<Subscription[]>(`/users/${id}/subscriptions`),
 
   listServers: () => request<Server[]>('/servers'),
+  patchServer: (
+    id: string,
+    payload: Partial<{
+      name: string;
+      panel_url: string;
+      panel_username: string;
+      panel_password: string;
+      subscription_base_url: string;
+      status: string;
+    }>
+  ) => request<Server>(`/servers/${id}`, {
+    method: 'PATCH',
+    body: JSON.stringify(payload),
+  }),
   deleteServer: (id: string, force = false) => request<void>(`/servers/${id}${force ? '?force=true' : ''}`, { method: 'DELETE' }),
   createServer: (payload: { name: string; panel_url: string; panel_username: string; panel_password: string; subscription_base_url: string }) =>
     request<Server>('/servers', { method: 'POST', body: JSON.stringify(payload) }),

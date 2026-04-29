@@ -3,21 +3,98 @@ import { Button, Card, Field, Input, Select } from './ui';
 import { fromLocalInputValue } from '../lib/format';
 import type { User } from '../lib/types';
 
-export function CreateServerForm({ onCreate }: { onCreate: (payload: { name: string; panel_url: string; panel_username: string; panel_password: string; subscription_base_url: string }) => Promise<void> }) {
-  const [form, setForm] = React.useState({ name: '', panel_url: '', panel_username: '', panel_password: '', subscription_base_url: '' });
+export function CreateServerForm({
+  onCreate,
+  initial,
+  title = 'Add server',
+  submitLabel = 'Create server',
+  onCancel,
+}: {
+  onCreate: (payload: {
+    name: string;
+    panel_url: string;
+    panel_username: string;
+    panel_password: string;
+    subscription_base_url: string;
+  }) => Promise<void>;
+  initial?: {
+    name: string;
+    panel_url: string;
+    subscription_base_url: string;
+  } | null;
+  title?: string;
+  submitLabel?: string;
+  onCancel?: () => void;
+}) {
+  const [form, setForm] = React.useState({
+    name: initial?.name || '',
+    panel_url: initial?.panel_url || '',
+    panel_username: '',
+    panel_password: '',
+    subscription_base_url: initial?.subscription_base_url || '',
+  });
+
+  React.useEffect(() => {
+    setForm({
+      name: initial?.name || '',
+      panel_url: initial?.panel_url || '',
+      panel_username: '',
+      panel_password: '',
+      subscription_base_url: initial?.subscription_base_url || '',
+    });
+  }, [initial]);
+
   const [busy, setBusy] = React.useState(false);
+
   async function submit(e: React.FormEvent) {
-    e.preventDefault(); setBusy(true);
-    try { await onCreate(form); setForm({ name: '', panel_url: '', panel_username: '', panel_password: '', subscription_base_url: '' }); } finally { setBusy(false); }
+    e.preventDefault();
+    setBusy(true);
+    try {
+      await onCreate(form);
+      if (!initial) {
+        setForm({
+          name: '',
+          panel_url: '',
+          panel_username: '',
+          panel_password: '',
+          subscription_base_url: '',
+        });
+      }
+    } finally {
+      setBusy(false);
+    }
   }
-  return <Card title="Add server"><form className="grid-form" onSubmit={submit}>
-    <Field label="Name"><Input required value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} placeholder="Germany #1" /></Field>
-    <Field label="Panel URL"><Input required value={form.panel_url} onChange={e => setForm({ ...form, panel_url: e.target.value })} placeholder="https://xui.example.com:2053" /></Field>
-    <Field label="Username"><Input required value={form.panel_username} onChange={e => setForm({ ...form, panel_username: e.target.value })} /></Field>
-    <Field label="Password"><Input required type="password" value={form.panel_password} onChange={e => setForm({ ...form, panel_password: e.target.value })} /></Field>
-    <Field label="Subscription base URL"><Input required value={form.subscription_base_url} onChange={e => setForm({ ...form, subscription_base_url: e.target.value })} placeholder="https://xui.example.com/sub" /></Field>
-    <div className="form-actions"><Button busy={busy}>Create server</Button></div>
-  </form></Card>;
+
+  return (
+    <Card title={title}>
+      <form className="grid-form" onSubmit={submit}>
+        <Field label="Name">
+          <Input required value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} />
+        </Field>
+
+        <Field label="Panel URL">
+          <Input required value={form.panel_url} onChange={e => setForm({ ...form, panel_url: e.target.value })} />
+        </Field>
+
+        <Field label="Username">
+          <Input required={!initial} value={form.panel_username} onChange={e => setForm({ ...form, panel_username: e.target.value })} />
+        </Field>
+
+        <Field label="Password">
+          <Input required={!initial} type="password" value={form.panel_password} onChange={e => setForm({ ...form, panel_password: e.target.value })} />
+        </Field>
+
+        <Field label="Subscription base URL">
+          <Input required value={form.subscription_base_url} onChange={e => setForm({ ...form, subscription_base_url: e.target.value })} />
+        </Field>
+
+        <div className="form-actions">
+          {onCancel && <Button type="button" variant="secondary" onClick={onCancel}>Cancel</Button>}
+          <Button busy={busy}>{submitLabel}</Button>
+        </div>
+      </form>
+    </Card>
+  );
 }
 
 export function CreateUserForm({ onCreate }: { onCreate: (payload: Partial<User>) => Promise<void> }) {

@@ -6,7 +6,7 @@ from sqlmodel import select
 
 from app.db import get_db
 from app.models import AuditEventType, RemoteConfig, RemoteConfigStatus, Server, ServerStatus, SubscriptionItem, SubscriptionSourceCache, now_utc
-from app.schemas import DeleteResult, RefreshConfigsResult, RemoteConfigRead, ServerCreate, ServerHealthRead, ServerRead
+from app.schemas import DeleteResult, RefreshConfigsResult, RemoteConfigRead, ServerCreate, ServerHealthRead, ServerRead, ServerUpdate
 from app.services.audit import audit
 from app.services.xui_adapter import XuiAdapter, XuiServerConfig
 
@@ -52,6 +52,36 @@ def create_server(payload: ServerCreate, db: Session = Depends(get_db)):
 def list_servers(db: Session = Depends(get_db)):
     return db.query(Server).order_by(Server.created_at.desc()).all()
 
+
+@router.patch("/{server_id}", response_model=ServerRead)
+def update_server(server_id: str, payload: ServerUpdate, db: Session = Depends(get_db)):
+    server = get_server_or_404(db, server_id)
+
+    if payload.name is not None:
+        server.name = payload.name
+    if payload.panel_url is not None:
+        server.panel_url = str(payload.panel_url).rstrip("/")
+    if payload.panel_username is not None:
+        server.panel_username = payload.panel_username
+    if payload.panel_password is not None:
+        server.panel_password = payload.panel_password
+    if payload.subscription_base_url is not None:
+        server.subscription_base_url = str(payload.subscription_base_url).rstrip("/")
+    if payload.status is not None:
+        server.status = payload.status
+
+    audit(
+        db,
+        AuditEventType.subscription_updated,
+        f"Server {server.name} updated",
+        entity_type="server",
+        entity_id=server.id,
+        payload=payload.model_dump(exclude_unset=True, exclude={"panel_password"}),
+    )
+
+    db.commit()
+    db.refresh(server)
+    return server
 
 
 @router.delete("/{server_id}", response_model=DeleteResult)

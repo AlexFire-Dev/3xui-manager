@@ -75,6 +75,22 @@ def _set_existing_or_first_attr(obj: Any, names: tuple[str, ...], value: Any) ->
     setattr(obj, names[0], value)
 
 
+def _set_inbound_settings(inbound: Any, settings: dict[str, Any]) -> None:
+    """
+    Обновляет inbound.settings.
+
+    В py3xui / 3x-ui settings иногда объект, иногда JSON-строка.
+    Для update inbound безопаснее положить JSON-строку.
+    """
+    value = json.dumps(settings, ensure_ascii=False)
+
+    if isinstance(inbound, dict):
+        inbound["settings"] = value
+        return
+
+    setattr(inbound, "settings", value)
+
+
 def _as_dict(value: Any) -> dict[str, Any]:
     """
     Универсально превращает объект py3xui / pydantic / dict / json-string в dict.
@@ -184,6 +200,40 @@ def _find_client(
             return candidate
 
     return None
+
+
+def _patch_client_dict_for_subscription(
+    existing_client: Any,
+    *,
+    sub_id: str,
+    expiry_time: int | None,
+    total_gb: int | None,
+    enable: bool | None,
+) -> dict[str, Any]:
+    """
+    Patch для клиентов внутри inbound.settings.clients.
+
+    Нужен для hysteria/hysteria2, где client.id / client.uuid может быть null,
+    и api.client.update() не подходит.
+    """
+    client_data = _as_dict(existing_client)
+
+    client_data["sub_id"] = sub_id
+    client_data["subId"] = sub_id
+
+    if expiry_time is not None:
+        client_data["expiry_time"] = expiry_time
+        client_data["expiryTime"] = expiry_time
+
+    if total_gb is not None:
+        client_data["total_gb"] = total_gb
+        client_data["totalGB"] = total_gb
+
+    if enable is not None:
+        client_data["enable"] = enable
+        client_data["enabled"] = enable
+
+    return client_data
 
 
 def _patch_client_for_subscription(
@@ -360,30 +410,129 @@ class XuiAdapter:
         api = self._api()
         api.inbound.get_list()
 
+    def _update_inbound_object(self, api: Any, inbound_id: int, inbound: Any) -> None:
+        """
+        Разные версии py3xui могут иметь разные сигнатуры inbound.update.
+        Пробуем несколько вариантов.
+        """
+        try:
+            api.inbound.update(inbound_id, inbound)
+            return
+        except TypeError:
+            pass
+
+        try:
+            api.inbound.update(inbound)
+            return
+        except TypeError:
+            pass
+
+        # Последний вариант — пусть реальная ошибка всплывёт наружу.
+        api.inbound.update(inbound_id, inbound)
+
+    def _set_hysteria_subscription_fields(
+            self,
+            *,
+            api: Any,
+            inbound: Any,
+            inbound_id: int,
+            client_email: str | None,
+            client_uuid: str | None,
+            sub_id: str,
+            expiry_time: int | None,
+            total_gb: int | None,
+            enable: bool | None,
+    ) -> str:
+        """
+        Hysteria/Hysteria2 в 3x-ui обновляем через inbound.settings.clients,
+        потому что у clients может не быть id/uuid, и api.client.update() падает.
+        """
+        settings = _get_inbound_settings(inbound)
+        clients = settings.get("clients") or []
+
+        if not isinstance(clients, list):
+            raise ValueError(f"Inbound {inbound_id} settings.clients is not a list")
+
+        found_index: int | None = None
+        found_client: Any | None = None
+
+        for index, candidate in enumerate(clients):
+            candidate_uuid = _get_attr(candidate, "id", "uuid")
+            candidate_email = _get_attr(candidate, "email")
+
+            if client_uuid and candidate_uuid and str(candidate_uuid) == client_uuid:
+                found_index = index
+                found_client = candidate
+                break
+
+            if client_email and candidate_email == client_email:
+                found_index = index
+                found_client = candidate
+                break
+
+        if found_index is None or found_client is None:
+            raise ValueError(
+                f"Hysteria client not found in inbound {inbound_id}: "
+                f"email={client_email!r}, uuid={client_uuid!r}"
+            )
+
+        patched_client = _patch_client_dict_for_subscription(
+            found_client,
+            sub_id=sub_id,
+            expiry_time=expiry_time,
+            total_gb=total_gb,
+            enable=enable,
+        )
+
+        clients[found_index] = patched_client
+        settings["clients"] = clients
+
+        _set_inbound_settings(inbound, settings)
+        self._update_inbound_object(api, inbound_id, inbound)
+
+        effective_uuid = _get_attr(found_client, "id", "uuid")
+        return str(effective_uuid or client_email)
+
     def set_client_subscription_fields(
-        self,
-        *,
-        inbound_id: int,
-        client_email: str | None,
-        client_uuid: str | None,
-        sub_id: str,
-        expiry_time: int | None = None,
-        total_gb: int | None = None,
-        enable: bool | None = True,
+            self,
+            *,
+            inbound_id: int,
+            client_email: str | None,
+            client_uuid: str | None,
+            sub_id: str,
+            expiry_time: int | None = None,
+            total_gb: int | None = None,
+            enable: bool | None = True,
     ) -> str:
         """Set subId plus optional expiry/traffic/enabled fields.
 
-        Returns the effective client UUID found on the server.
+        VLESS/VMess/Trojan:
+          обновляем через api.client.update()
 
-        Важное изменение:
-        - update теперь делается как PATCH поверх существующего client;
-        - flow и остальные поля не должны перетираться.
+        Hysteria/Hysteria2:
+          обновляем через inbound.settings.clients + api.inbound.update()
         """
         if not client_email and not client_uuid:
             raise ValueError("client_email or client_uuid is required")
 
         api = self._api()
         inbound = api.inbound.get_by_id(inbound_id)
+
+        inbound_protocol = str(_get_attr(inbound, "protocol", default="") or "").lower()
+
+        if inbound_protocol in {"hysteria", "hysteria2", "hy2"}:
+            return self._set_hysteria_subscription_fields(
+                api=api,
+                inbound=inbound,
+                inbound_id=inbound_id,
+                client_email=client_email,
+                client_uuid=client_uuid,
+                sub_id=sub_id,
+                expiry_time=expiry_time,
+                total_gb=total_gb,
+                enable=enable,
+            )
+
         clients = _get_clients_from_inbound(inbound)
 
         inbound_client = _find_client(
@@ -401,20 +550,6 @@ class XuiAdapter:
         raw_uuid = _get_attr(inbound_client, "id", "uuid")
         effective_uuid = str(raw_uuid) if raw_uuid else ""
 
-        # Не используем api.client.get_by_email как источник правды для update,
-        # потому что он может вернуть урезанную модель без flow.
-        #
-        # Используем client ровно из inbound.settings.clients,
-        # где обычно лежит полный объект клиента.
-        patched_client = _patch_client_for_subscription(
-            inbound_client,
-            effective_uuid=effective_uuid,
-            sub_id=sub_id,
-            expiry_time=expiry_time,
-            total_gb=total_gb,
-            enable=enable,
-        )
-
         update_key = effective_uuid or client_email
 
         if not update_key:
@@ -422,7 +557,42 @@ class XuiAdapter:
                 f"Cannot update client in inbound {inbound_id}: no uuid and no email"
             )
 
-        api.client.update(update_key, patched_client)
+        update_client = None
+
+        if client_email:
+            try:
+                update_client = api.client.get_by_email(client_email)
+            except Exception:
+                update_client = None
+
+        if update_client is None:
+            raise ValueError(
+                f"Cannot load py3xui client object for update: "
+                f"email={client_email!r}, uuid={effective_uuid!r}"
+            )
+
+        inbound_flow = _get_attr(inbound_client, "flow")
+        update_flow = _get_attr(update_client, "flow")
+
+        if inbound_flow and not update_flow:
+            _set_existing_or_first_attr(update_client, ("flow",), inbound_flow)
+
+        if effective_uuid:
+            _set_existing_or_first_attr(update_client, ("id", "uuid"), effective_uuid)
+
+        _set_existing_or_first_attr(update_client, ("sub_id", "subId"), sub_id)
+
+        if expiry_time is not None:
+            _set_existing_or_first_attr(update_client, ("expiry_time", "expiryTime"), expiry_time)
+
+        if total_gb is not None:
+            _set_existing_or_first_attr(update_client, ("total_gb", "totalGB"), total_gb)
+
+        if enable is not None:
+            _set_existing_or_first_attr(update_client, ("enable", "enabled"), enable)
+
+        api.client.update(update_key, update_client)
+
         return effective_uuid or str(client_email)
 
     def set_client_sub_id(

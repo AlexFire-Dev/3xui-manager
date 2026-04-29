@@ -97,7 +97,7 @@ class RemoteConfigRead(BaseModel):
     inbound_remark: str | None
     inbound_protocol: str | None
     inbound_port: int | None
-    client_uuid: str
+    client_uuid: str | None = None
     client_email: str | None
     client_sub_id: str | None
     client_enable: bool | None

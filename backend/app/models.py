@@ -101,7 +101,7 @@ class RemoteConfig(Base):
     inbound_remark: Mapped[str | None] = mapped_column(String(255), nullable=True)
     inbound_protocol: Mapped[str | None] = mapped_column(String(64), nullable=True)
     inbound_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    client_uuid: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    client_uuid: Mapped[str] = mapped_column(String(128), nullable=True)
     client_email: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
     client_sub_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
     client_enable: Mapped[bool | None] = mapped_column(Boolean, nullable=True)

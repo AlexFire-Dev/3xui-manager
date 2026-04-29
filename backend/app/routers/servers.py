@@ -2,6 +2,7 @@ import json
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
+from sqlmodel import select
 
 from app.db import get_db
 from app.models import AuditEventType, RemoteConfig, RemoteConfigStatus, Server, ServerStatus, SubscriptionItem, SubscriptionSourceCache, now_utc
@@ -168,15 +169,22 @@ def refresh_configs(server_id: str, db: Session = Depends(get_db)):
     for cfg in discovered:
         key = (cfg.inbound_id, cfg.client_uuid)
         seen_keys.add(key)
-        existing = (
-            db.query(RemoteConfig)
-            .filter(
-                RemoteConfig.server_id == server.id,
-                RemoteConfig.inbound_id == cfg.inbound_id,
-                RemoteConfig.client_uuid == cfg.client_uuid,
-            )
-            .first()
+
+        query = select(RemoteConfig).where(
+            RemoteConfig.server_id == server.id,
+            RemoteConfig.inbound_id == discovered.inbound_id,
         )
+
+        if discovered.client_uuid:
+            query = query.where(RemoteConfig.client_uuid == discovered.client_uuid)
+        elif discovered.client_email:
+            query = query.where(RemoteConfig.client_email == discovered.client_email)
+        else:
+            query = query.where(RemoteConfig.client_uuid.is_(None)).where(
+                RemoteConfig.client_email.is_(None)
+            )
+
+        existing = session.exec(query).first()
         if existing is None:
             existing = RemoteConfig(server_id=server.id, inbound_id=cfg.inbound_id, client_uuid=cfg.client_uuid, discovered_at=now)
             db.add(existing)

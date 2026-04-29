@@ -221,7 +221,8 @@ def _patch_client_for_subscription(
     """
     patched = deepcopy(existing_client)
 
-    _set_existing_or_first_attr(patched, ("id", "uuid"), effective_uuid)
+    if effective_uuid:
+        _set_existing_or_first_attr(patched, ("id", "uuid"), effective_uuid)
     _set_existing_or_first_attr(patched, ("sub_id", "subId"), sub_id)
 
     if expiry_time is not None:
@@ -397,7 +398,8 @@ class XuiAdapter:
                 f"email={client_email!r}, uuid={client_uuid!r}"
             )
 
-        effective_uuid = str(_get_attr(inbound_client, "id", "uuid"))
+        raw_uuid = _get_attr(inbound_client, "id", "uuid")
+        effective_uuid = str(raw_uuid) if raw_uuid else ""
 
         # Не используем api.client.get_by_email как источник правды для update,
         # потому что он может вернуть урезанную модель без flow.
@@ -413,8 +415,15 @@ class XuiAdapter:
             enable=enable,
         )
 
-        api.client.update(effective_uuid, patched_client)
-        return effective_uuid
+        update_key = effective_uuid or client_email
+
+        if not update_key:
+            raise ValueError(
+                f"Cannot update client in inbound {inbound_id}: no uuid and no email"
+            )
+
+        api.client.update(update_key, patched_client)
+        return effective_uuid or str(client_email)
 
     def set_client_sub_id(
         self,

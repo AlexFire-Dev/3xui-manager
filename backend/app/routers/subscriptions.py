@@ -3,8 +3,6 @@ from collections import defaultdict
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.orm import Session, joinedload, selectinload
 
-from app.services.xui_factory import make_adapter
-
 
 from app.db import get_db
 from app.models import (

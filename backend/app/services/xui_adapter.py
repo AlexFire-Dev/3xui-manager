@@ -77,18 +77,29 @@ def _set_existing_or_first_attr(obj: Any, names: tuple[str, ...], value: Any) ->
 
 def _set_inbound_settings(inbound: Any, settings: dict[str, Any]) -> None:
     """
-    Обновляет inbound.settings.
+    Обновляет inbound.settings, сохраняя формат, который ожидает py3xui.
 
-    В py3xui / 3x-ui settings иногда объект, иногда JSON-строка.
-    Для update inbound безопаснее положить JSON-строку.
+    В текущей версии py3xui inbound.update() ожидает не JSON-строку,
+    а объект settings, у которого есть model_dump_json().
+    Поэтому, если исходный settings был объектом py3xui/pydantic,
+    патчим его clients на месте.
     """
-    value = json.dumps(settings, ensure_ascii=False)
+    current_settings = _get_attr(inbound, "settings", default=None)
 
-    if isinstance(inbound, dict):
-        inbound["settings"] = value
+    if isinstance(current_settings, dict):
+        current_settings.clear()
+        current_settings.update(settings)
         return
 
-    setattr(inbound, "settings", value)
+    if hasattr(current_settings, "clients"):
+        setattr(current_settings, "clients", settings.get("clients", []))
+        return
+
+    if isinstance(inbound, dict):
+        inbound["settings"] = settings
+        return
+
+    setattr(inbound, "settings", settings)
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -444,11 +455,15 @@ class XuiAdapter:
             enable: bool | None,
     ) -> str:
         """
-        Hysteria/Hysteria2 в 3x-ui обновляем через inbound.settings.clients,
-        потому что у clients может не быть id/uuid, и api.client.update() падает.
+        Hysteria/Hysteria2 в 3x-ui обновляем через inbound.settings.clients.
+
+        Важно:
+        clients внутри settings могут быть pydantic/py3xui объектами.
+        Поэтому нельзя превращать settings в JSON-строку перед inbound.update().
         """
-        settings = _get_inbound_settings(inbound)
-        clients = settings.get("clients") or []
+        settings_obj = _get_attr(inbound, "settings", default=None)
+        settings_dict = _get_inbound_settings(inbound)
+        clients = settings_dict.get("clients") or []
 
         if not isinstance(clients, list):
             raise ValueError(f"Inbound {inbound_id} settings.clients is not a list")
@@ -476,7 +491,7 @@ class XuiAdapter:
                 f"email={client_email!r}, uuid={client_uuid!r}"
             )
 
-        patched_client = _patch_client_dict_for_subscription(
+        patched_client_dict = _patch_client_dict_for_subscription(
             found_client,
             sub_id=sub_id,
             expiry_time=expiry_time,
@@ -484,10 +499,31 @@ class XuiAdapter:
             enable=enable,
         )
 
-        clients[found_index] = patched_client
-        settings["clients"] = clients
+        # Если settings_obj.clients содержит реальные объекты, патчим объект на месте.
+        original_clients = _get_attr(settings_obj, "clients", default=None)
 
-        _set_inbound_settings(inbound, settings)
+        if isinstance(original_clients, list) and found_index < len(original_clients):
+            original_client_obj = original_clients[found_index]
+
+            if isinstance(original_client_obj, dict):
+                original_client_obj.clear()
+                original_client_obj.update(patched_client_dict)
+            else:
+                for key, value in patched_client_dict.items():
+                    try:
+                        setattr(original_client_obj, key, value)
+                    except Exception:
+                        pass
+
+            # оставляем settings_obj как объект py3xui/pydantic
+            setattr(settings_obj, "clients", original_clients)
+
+        else:
+            # fallback для dict/string settings
+            clients[found_index] = patched_client_dict
+            settings_dict["clients"] = clients
+            _set_inbound_settings(inbound, settings_dict)
+
         self._update_inbound_object(api, inbound_id, inbound)
 
         effective_uuid = _get_attr(found_client, "id", "uuid")

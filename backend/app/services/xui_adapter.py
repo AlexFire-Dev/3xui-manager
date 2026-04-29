@@ -676,3 +676,20 @@ class XuiAdapter:
             prefix=prefix,
         )
         return links
+
+    def clear_client_sub_id(
+            self,
+            *,
+            inbound_id: int,
+            client_email: str | None,
+            client_uuid: str | None,
+    ) -> str:
+        return self.set_client_subscription_fields(
+            inbound_id=inbound_id,
+            client_email=client_email,
+            client_uuid=client_uuid,
+            sub_id="",
+            expiry_time=None,
+            total_gb=None,
+            enable=None,
+        )

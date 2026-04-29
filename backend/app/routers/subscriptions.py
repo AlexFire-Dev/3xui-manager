@@ -3,6 +3,9 @@ from collections import defaultdict
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.orm import Session, joinedload, selectinload
 
+from app.services.xui_factory import make_adapter
+
+
 from app.db import get_db
 from app.models import (
     AuditEventType,
@@ -305,13 +308,80 @@ def patch_subscription_item(subscription_id: str, item_id: str, payload: Subscri
 
 
 @router.delete("/{subscription_id}/items/{item_id}", status_code=204)
-def delete_subscription_item(subscription_id: str, item_id: str, db: Session = Depends(get_db)):
-    get_subscription_or_404(db, subscription_id)
-    item = db.query(SubscriptionItem).filter(SubscriptionItem.id == item_id, SubscriptionItem.subscription_id == subscription_id).first()
+def delete_subscription_item(
+    subscription_id: str,
+    item_id: str,
+    db: Session = Depends(get_db),
+):
+    subscription = get_subscription_or_404(db, subscription_id)
+
+    item = (
+        db.query(SubscriptionItem)
+        .filter(
+            SubscriptionItem.id == item_id,
+            SubscriptionItem.subscription_id == subscription_id,
+        )
+        .first()
+    )
+
     if not item:
         raise HTTPException(status_code=404, detail="Subscription item not found")
+
+    remote_config = (
+        db.query(RemoteConfig)
+        .filter(RemoteConfig.id == item.remote_config_id)
+        .first()
+    )
+
+    if remote_config:
+        server = (
+            db.query(Server)
+            .filter(Server.id == remote_config.server_id)
+            .first()
+        )
+
+        if server:
+            try:
+                make_adapter(server).clear_client_sub_id(
+                    inbound_id=remote_config.inbound_id,
+                    client_email=remote_config.client_email,
+                    client_uuid=remote_config.client_uuid,
+                )
+            except Exception as exc:  # noqa: BLE001
+                audit(
+                    db,
+                    AuditEventType.item_deleted,
+                    f"Failed to clear remote subId for item {item_id}: {exc}",
+                    entity_type="subscription",
+                    entity_id=subscription_id,
+                    payload={
+                        "item_id": item_id,
+                        "remote_config_id": remote_config.id,
+                        "server_id": server.id,
+                        "error": str(exc),
+                    },
+                )
+
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Failed to remove config from remote 3x-ui subscription: {exc}",
+                ) from exc
+
     db.delete(item)
-    audit(db, AuditEventType.item_deleted, f"Subscription item {item_id} deleted", entity_type="subscription", entity_id=subscription_id)
+
+    audit(
+        db,
+        AuditEventType.item_deleted,
+        f"Subscription item {item_id} deleted and remote subId cleared",
+        entity_type="subscription",
+        entity_id=subscription_id,
+        payload={
+            "item_id": item_id,
+            "remote_config_id": item.remote_config_id,
+            "subscription_id": subscription.id,
+        },
+    )
+
     db.commit()
     return None
 

@@ -150,7 +150,7 @@ def refresh_configs(server_id: str, db: Session = Depends(get_db)):
     now = now_utc()
 
     try:
-        discovered = make_adapter(server).list_client_configs()
+        discovered_configs = make_adapter(server).list_client_configs()
         server.status = ServerStatus.active
         server.last_health_at = now
         server.last_health_error = None
@@ -161,37 +161,49 @@ def refresh_configs(server_id: str, db: Session = Depends(get_db)):
         server.last_health_at = now
         server.last_health_error = str(exc)
         db.commit()
-        raise HTTPException(status_code=502, detail=f"Failed to refresh configs from 3x-ui: {exc}") from exc
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to refresh configs from 3x-ui: {exc}",
+        ) from exc
 
-    seen_keys: set[tuple[int, str]] = set()
+    seen_keys: set[tuple[int, str | None, str | None]] = set()
     upserted = 0
 
-    for cfg in discovered:
-        key = (cfg.inbound_id, cfg.client_uuid)
+    for cfg in discovered_configs:
+        key = (cfg.inbound_id, cfg.client_uuid, cfg.client_email)
         seen_keys.add(key)
 
-        query = select(RemoteConfig).where(
+        query = db.query(RemoteConfig).filter(
             RemoteConfig.server_id == server.id,
-            RemoteConfig.inbound_id == discovered.inbound_id,
+            RemoteConfig.inbound_id == cfg.inbound_id,
         )
 
-        if discovered.client_uuid:
-            query = query.where(RemoteConfig.client_uuid == discovered.client_uuid)
-        elif discovered.client_email:
-            query = query.where(RemoteConfig.client_email == discovered.client_email)
+        if cfg.client_uuid:
+            query = query.filter(RemoteConfig.client_uuid == cfg.client_uuid)
+        elif cfg.client_email:
+            query = query.filter(RemoteConfig.client_email == cfg.client_email)
         else:
-            query = query.where(RemoteConfig.client_uuid.is_(None)).where(
-                RemoteConfig.client_email.is_(None)
+            query = query.filter(
+                RemoteConfig.client_uuid.is_(None),
+                RemoteConfig.client_email.is_(None),
             )
 
-        existing = session.exec(query).first()
+        existing = query.first()
+
         if existing is None:
-            existing = RemoteConfig(server_id=server.id, inbound_id=cfg.inbound_id, client_uuid=cfg.client_uuid, discovered_at=now)
+            existing = RemoteConfig(
+                server_id=server.id,
+                inbound_id=cfg.inbound_id,
+                client_uuid=cfg.client_uuid,
+                client_email=cfg.client_email,
+                discovered_at=now,
+            )
             db.add(existing)
 
         existing.inbound_remark = cfg.inbound_remark
         existing.inbound_protocol = cfg.inbound_protocol
         existing.inbound_port = cfg.inbound_port
+        existing.client_uuid = cfg.client_uuid
         existing.client_email = cfg.client_email
         existing.client_sub_id = cfg.client_sub_id
         existing.client_enable = cfg.client_enable
@@ -202,27 +214,59 @@ def refresh_configs(server_id: str, db: Session = Depends(get_db)):
         existing.raw_json = json.dumps(cfg.raw, ensure_ascii=False, default=str)
         existing.status = RemoteConfigStatus.active
         existing.updated_at = now
+
         upserted += 1
 
     marked_missing = 0
-    existing_configs = db.query(RemoteConfig).filter(RemoteConfig.server_id == server.id).all()
+    existing_configs = (
+        db.query(RemoteConfig)
+        .filter(RemoteConfig.server_id == server.id)
+        .all()
+    )
+
     for existing in existing_configs:
-        if (existing.inbound_id, existing.client_uuid) not in seen_keys and existing.status != RemoteConfigStatus.missing:
+        existing_key = (
+            existing.inbound_id,
+            existing.client_uuid,
+            existing.client_email,
+        )
+
+        if (
+            existing_key not in seen_keys
+            and existing.status != RemoteConfigStatus.missing
+        ):
             existing.status = RemoteConfigStatus.missing
             existing.updated_at = now
             marked_missing += 1
 
     server.last_config_refresh_at = now
     server.last_config_refresh_error = None
+
     audit(
         db,
         AuditEventType.configs_refreshed,
-        f"Refreshed {len(discovered)} configs from {server.name}",
+        f"Refreshed {len(discovered_configs)} configs from {server.name}",
         entity_type="server",
         entity_id=server.id,
-        payload={"discovered": len(discovered), "upserted": upserted, "marked_missing": marked_missing},
+        payload={
+            "discovered": len(discovered_configs),
+            "upserted": upserted,
+            "marked_missing": marked_missing,
+        },
     )
+
     db.commit()
 
-    configs = db.query(RemoteConfig).filter(RemoteConfig.server_id == server.id).all()
-    return RefreshConfigsResult(server_id=server.id, discovered=len(discovered), upserted=upserted, marked_missing=marked_missing, configs=configs)
+    configs = (
+        db.query(RemoteConfig)
+        .filter(RemoteConfig.server_id == server.id)
+        .all()
+    )
+
+    return RefreshConfigsResult(
+        server_id=server.id,
+        discovered=len(discovered_configs),
+        upserted=upserted,
+        marked_missing=marked_missing,
+        configs=configs,
+    )

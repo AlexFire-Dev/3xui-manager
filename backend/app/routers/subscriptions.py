@@ -325,45 +325,58 @@ def delete_subscription_item(
     if not item:
         raise HTTPException(status_code=404, detail="Subscription item not found")
 
-    remote_config = (
-        db.query(RemoteConfig)
-        .filter(RemoteConfig.id == item.remote_config_id)
-        .first()
+    remote_config_query = db.query(RemoteConfig).filter(
+        RemoteConfig.server_id == item.server_id,
+        RemoteConfig.inbound_id == item.inbound_id,
     )
 
-    if remote_config:
-        server = (
-            db.query(Server)
-            .filter(Server.id == remote_config.server_id)
-            .first()
+    if item.client_uuid:
+        remote_config_query = remote_config_query.filter(
+            RemoteConfig.client_uuid == item.client_uuid,
+        )
+    elif item.client_email:
+        remote_config_query = remote_config_query.filter(
+            RemoteConfig.client_email == item.client_email,
+        )
+    else:
+        remote_config_query = remote_config_query.filter(
+            RemoteConfig.client_uuid.is_(None),
+            RemoteConfig.client_email.is_(None),
         )
 
-        if server:
-            try:
-                make_adapter(server).clear_client_sub_id(
-                    inbound_id=remote_config.inbound_id,
-                    client_email=remote_config.client_email,
-                    client_uuid=remote_config.client_uuid,
-                )
-            except Exception as exc:  # noqa: BLE001
-                audit(
-                    db,
-                    AuditEventType.item_deleted,
-                    f"Failed to clear remote subId for item {item_id}: {exc}",
-                    entity_type="subscription",
-                    entity_id=subscription_id,
-                    payload={
-                        "item_id": item_id,
-                        "remote_config_id": remote_config.id,
-                        "server_id": server.id,
-                        "error": str(exc),
-                    },
-                )
+    remote_config = remote_config_query.first()
 
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"Failed to remove config from remote 3x-ui subscription: {exc}",
-                ) from exc
+    server = db.query(Server).filter(Server.id == item.server_id).first()
+
+    if server:
+        try:
+            make_adapter(server).clear_client_sub_id(
+                inbound_id=item.inbound_id,
+                client_email=item.client_email,
+                client_uuid=item.client_uuid,
+            )
+        except Exception as exc:  # noqa: BLE001
+            audit(
+                db,
+                AuditEventType.item_deleted,
+                f"Failed to clear remote subId for item {item_id}: {exc}",
+                entity_type="subscription",
+                entity_id=subscription_id,
+                payload={
+                    "item_id": item_id,
+                    "server_id": item.server_id,
+                    "inbound_id": item.inbound_id,
+                    "client_email": item.client_email,
+                    "client_uuid": item.client_uuid,
+                    "remote_config_id": remote_config.id if remote_config else None,
+                    "error": str(exc),
+                },
+            )
+
+            raise HTTPException(
+                status_code=502,
+                detail=f"Failed to remove config from remote 3x-ui subscription: {exc}",
+            ) from exc
 
     db.delete(item)
 
@@ -375,8 +388,12 @@ def delete_subscription_item(
         entity_id=subscription_id,
         payload={
             "item_id": item_id,
-            "remote_config_id": item.remote_config_id,
             "subscription_id": subscription.id,
+            "server_id": item.server_id,
+            "inbound_id": item.inbound_id,
+            "client_email": item.client_email,
+            "client_uuid": item.client_uuid,
+            "remote_config_id": remote_config.id if remote_config else None,
         },
     )
 

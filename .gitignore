@@ -1,0 +1,5 @@
+.idea/
+
+backend/.env
+frontend/.env
+.env

@@ -25,6 +25,8 @@ class UserCreate(BaseModel):
     email: str | None = None
     telegram_id: str | None = None
 
+    subscription_userinfo: str | None = None
+
 
 class UserUpdate(BaseModel):
     external_id: str | None = None
@@ -38,12 +40,16 @@ class UserUpdate(BaseModel):
     email_set: bool = False
     telegram_id_set: bool = False
 
+    subscription_userinfo: str | None = None
+    subscription_userinfo_set: bool = False
+
     @model_validator(mode="after")
     def mark_explicit_fields(self):
         self.external_id_set = "external_id" in self.model_fields_set
         self.name_set = "name" in self.model_fields_set
         self.email_set = "email" in self.model_fields_set
         self.telegram_id_set = "telegram_id" in self.model_fields_set
+        self.subscription_userinfo_set = "subscription_userinfo" in self.model_fields_set
         return self
 
 
@@ -55,6 +61,8 @@ class UserRead(BaseModel):
     telegram_id: str | None
     status: UserStatus
     created_at: datetime
+
+    subscription_userinfo: str | None = None
 
     model_config = {"from_attributes": True}
 

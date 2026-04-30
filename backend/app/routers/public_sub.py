@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Response
 from sqlalchemy.orm import Session, selectinload
 
 from app.db import get_db
@@ -10,6 +10,8 @@ from app.models import (
     SubscriptionSourceCache,
     SubscriptionStatus,
     now_utc,
+    SubscriptionHwid,
+    User,
 )
 from app.services.subscription_codec import encode_response
 from app.services.xui_adapter import XuiAdapter, XuiServerConfig
@@ -29,11 +31,16 @@ async def get_public_subscription(
     token: str,
     format: str = "plain",
     use_cache_on_error: bool = True,
+    hwid: str | None = Header(default=None, alias="X-HWID"),
+    user_agent: str | None = Header(default=None, alias="User-Agent"),
     db: Session = Depends(get_db),
 ):
     subscription = (
         db.query(Subscription)
-        .options(selectinload(Subscription.items).selectinload(SubscriptionItem.server))
+        .options(
+            selectinload(Subscription.items).selectinload(SubscriptionItem.server),
+            selectinload(Subscription.user),
+        )
         .filter(Subscription.token == token)
         .first()
     )
@@ -47,17 +54,45 @@ async def get_public_subscription(
     if expires_at and expires_at < utc_now():
         return Response(content="", media_type="text/plain")
 
+    if hwid:
+        normalized_hwid = hwid.strip()[:255]
+
+        if normalized_hwid:
+            existing_hwid = (
+                db.query(SubscriptionHwid)
+                .filter(
+                    SubscriptionHwid.subscription_id == subscription.id,
+                    SubscriptionHwid.hwid == normalized_hwid,
+                )
+                .first()
+            )
+
+            if existing_hwid:
+                existing_hwid.last_seen_at = now_utc()
+                existing_hwid.requests_count = (existing_hwid.requests_count or 0) + 1
+                existing_hwid.user_agent = user_agent
+            else:
+                db.add(
+                    SubscriptionHwid(
+                        subscription_id=subscription.id,
+                        hwid=normalized_hwid,
+                        user_agent=user_agent,
+                    )
+                )
+
     links: list[str] = []
     active_items = [
         item
         for item in sorted(subscription.items, key=lambda item: item.sort_order)
-        if item.enabled and item.status == ItemStatus.synced and item.server and item.server.status == ServerStatus.active
+        if item.enabled
+        and item.status == ItemStatus.synced
+        and item.server
+        and item.server.status == ServerStatus.active
     ]
 
-    # 3x-ui native subscription endpoint is per subId on a server, not per item.
-    # Query each selected server only once, then cache its normalized response.
     server_ids_in_order: list[str] = []
     servers_by_id = {}
+
     for item in active_items:
         if item.server_id not in servers_by_id:
             server_ids_in_order.append(item.server_id)
@@ -65,6 +100,7 @@ async def get_public_subscription(
 
     for server_id in server_ids_in_order:
         server = servers_by_id[server_id]
+
         cache = (
             db.query(SubscriptionSourceCache)
             .filter(
@@ -73,12 +109,17 @@ async def get_public_subscription(
             )
             .first()
         )
+
         if cache is None:
-            cache = SubscriptionSourceCache(subscription_id=subscription.id, server_id=server_id)
+            cache = SubscriptionSourceCache(
+                subscription_id=subscription.id,
+                server_id=server_id,
+            )
             db.add(cache)
             db.flush()
 
         cache.last_attempt_at = now_utc()
+
         adapter = XuiAdapter(
             XuiServerConfig(
                 panel_url=server.panel_url,
@@ -87,22 +128,39 @@ async def get_public_subscription(
                 subscription_base_url=server.subscription_base_url,
             )
         )
+
         try:
             server_links, raw = await adapter.fetch_subscription_links_with_raw(
                 subscription.shared_sub_id,
                 prefix=server.name,
             )
+
             cache.raw_response = raw
             cache.normalized_links = "\n".join(server_links)
             cache.last_success_at = now_utc()
             cache.last_error = None
+
             links.extend(server_links)
+
         except Exception as exc:  # noqa: BLE001
             cache.last_error = str(exc)
+
             if use_cache_on_error:
                 links.extend(_links_from_cache(cache))
+
             continue
 
     db.commit()
+
     body = encode_response(links, fmt=format)
-    return Response(content=body, media_type="text/plain; charset=utf-8")
+
+    headers: dict[str, str] = {}
+
+    if subscription.user and subscription.user.subscription_userinfo:
+        headers["Subscription-Userinfo"] = subscription.user.subscription_userinfo
+
+    return Response(
+        content=body,
+        media_type="text/plain; charset=utf-8",
+        headers=headers,
+    )

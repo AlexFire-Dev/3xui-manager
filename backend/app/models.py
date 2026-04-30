@@ -69,6 +69,7 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
 
     subscriptions: Mapped[list["Subscription"]] = relationship(back_populates="user")
+    subscription_userinfo: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class Server(Base):
@@ -133,6 +134,10 @@ class Subscription(Base):
     user: Mapped[User | None] = relationship(back_populates="subscriptions")
     items: Mapped[list["SubscriptionItem"]] = relationship(back_populates="subscription", cascade="all, delete-orphan")
     source_caches: Mapped[list["SubscriptionSourceCache"]] = relationship(back_populates="subscription", cascade="all, delete-orphan")
+    hwids: Mapped[list["SubscriptionHwid"]] = relationship(
+        back_populates="subscription",
+        cascade="all, delete-orphan",
+    )
 
 
 class SubscriptionItem(Base):
@@ -152,6 +157,23 @@ class SubscriptionItem(Base):
 
     subscription: Mapped[Subscription] = relationship(back_populates="items")
     server: Mapped[Server] = relationship(back_populates="items")
+
+
+class SubscriptionHwid(Base):
+    __tablename__ = "subscription_hwids"
+    __table_args__ = (
+        UniqueConstraint("subscription_id", "hwid", name="uq_subscription_hwid"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    subscription_id: Mapped[str] = mapped_column(ForeignKey("subscriptions.id"), nullable=False, index=True)
+    hwid: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    requests_count: Mapped[int] = mapped_column(Integer, default=1)
+    user_agent: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    subscription: Mapped["Subscription"] = relationship(back_populates="hwids")
 
 
 class SubscriptionSourceCache(Base):

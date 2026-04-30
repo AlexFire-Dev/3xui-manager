@@ -608,15 +608,15 @@ class XuiAdapter:
         api.inbound.update(inbound_id, inbound)
 
     def _set_hysteria_subscription_fields(
-        self,
-        *,
-        inbound_id: int,
-        client_email: str | None,
-        client_uuid: str | None,
-        sub_id: str,
-        expiry_time: int | None,
-        total_gb: int | None,
-        enable: bool | None,
+            self,
+            *,
+            inbound_id: int,
+            client_email: str | None,
+            client_uuid: str | None,
+            sub_id: str,
+            expiry_time: int | None,
+            total_gb: int | None,
+            enable: bool | None,
     ) -> str:
         """
         Hysteria/Hysteria2 обновляем только через raw 3x-ui API.
@@ -633,7 +633,9 @@ class XuiAdapter:
         - password и остальные поля не трогаем;
         - отправляем весь inbound обратно raw payload'ом.
         """
-        with self._login_http_client() as http_client:
+        http_client = self._login_http_client()
+
+        try:
             inbound_raw = self._fetch_inbound_raw_via_http(http_client, inbound_id)
 
             settings = inbound_raw.get("settings") or {}
@@ -713,6 +715,9 @@ class XuiAdapter:
 
             effective_uuid = found_client.get("id") or found_client.get("uuid")
             return str(effective_uuid or "")
+
+        finally:
+            http_client.close()
 
     def set_client_subscription_fields(
         self,

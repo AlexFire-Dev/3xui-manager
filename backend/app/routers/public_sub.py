@@ -157,7 +157,7 @@ async def get_public_subscription(
     headers: dict[str, str] = {}
 
     if subscription.user and subscription.user.subscription_userinfo:
-        headers["Subscription-Userinfo"] = subscription.user.subscription_userinfo
+        headers["Subscription-Userinfo"] = f"{subscription.user.subscription_userinfo}, {subscription.user.name}!"
 
     return Response(
         content=body,

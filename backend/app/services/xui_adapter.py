@@ -314,11 +314,45 @@ def _patch_client_for_subscription(
     return patched
 
 
+def _set_dict_alias(
+    data: dict[str, Any],
+    names: tuple[str, ...],
+    value: Any,
+    *,
+    default_name: str,
+) -> None:
+    for name in names:
+        if name in data:
+            data[name] = value
+            return
+
+    data[default_name] = value
+
+
+def _json_string_or_same(value: Any) -> Any:
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return value
+
+
+def _parse_3xui_json_field(value: Any) -> Any:
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return value
+    return value
+
+
 class XuiAdapter:
     """Boundary around 3x-ui.
 
-    Panel mutations are done via py3xui; generated subscription responses are
-    fetched from 3x-ui's native `/sub/{subId}` endpoint.
+    Panel mutations are mostly done via py3xui.
+
+    Important exception:
+    Hysteria/Hysteria2 clients are updated via raw 3x-ui HTTP API,
+    because py3xui typed models may lose settings.clients[].password
+    during inbound serialization.
     """
 
     def __init__(self, config: XuiServerConfig):
@@ -347,6 +381,119 @@ class XuiAdapter:
         api.login()
         return api
 
+    def _panel_url(self, path: str) -> str:
+        return self.config.panel_url.rstrip("/") + "/" + path.lstrip("/")
+
+    def _login_http_client(self) -> httpx.Client:
+        client = httpx.Client(
+            timeout=20.0,
+            follow_redirects=True,
+            verify=self.config.use_tls_verify,
+        )
+
+        response = client.post(
+            self._panel_url("/login"),
+            data={
+                "username": self.config.panel_username,
+                "password": self.config.panel_password,
+            },
+        )
+        response.raise_for_status()
+
+        try:
+            payload = response.json()
+            if isinstance(payload, dict) and payload.get("success") is False:
+                raise RuntimeError(payload.get("msg") or "3x-ui login failed")
+        except ValueError:
+            pass
+
+        return client
+
+    @staticmethod
+    def _extract_3xui_obj(response: httpx.Response) -> Any:
+        response.raise_for_status()
+
+        payload = response.json()
+
+        if isinstance(payload, dict):
+            if payload.get("success") is False:
+                raise RuntimeError(payload.get("msg") or "3x-ui API request failed")
+
+            if "obj" in payload:
+                return payload["obj"]
+
+        return payload
+
+    def _fetch_inbound_raw_via_http(
+        self,
+        client: httpx.Client,
+        inbound_id: int,
+    ) -> dict[str, Any]:
+        response = client.get(self._panel_url(f"/panel/api/inbounds/get/{inbound_id}"))
+        obj = self._extract_3xui_obj(response)
+
+        if not isinstance(obj, dict):
+            obj = _as_dict(obj)
+
+        for key in ("settings", "streamSettings", "sniffing", "allocate"):
+            if key in obj:
+                obj[key] = _parse_3xui_json_field(obj[key])
+
+        return obj
+
+    def _update_inbound_raw_via_http(
+        self,
+        client: httpx.Client,
+        inbound_id: int,
+        inbound_raw: dict[str, Any],
+    ) -> None:
+        payload: dict[str, Any] = {}
+
+        allowed_keys = (
+            "id",
+            "up",
+            "down",
+            "total",
+            "remark",
+            "enable",
+            "expiryTime",
+            "listen",
+            "port",
+            "protocol",
+            "settings",
+            "streamSettings",
+            "tag",
+            "sniffing",
+            "allocate",
+        )
+
+        for key in allowed_keys:
+            if key in inbound_raw:
+                payload[key] = inbound_raw[key]
+
+        payload["id"] = inbound_id
+
+        for key in ("settings", "streamSettings", "sniffing", "allocate"):
+            if key in payload:
+                payload[key] = _json_string_or_same(payload[key])
+
+        url = self._panel_url(f"/panel/api/inbounds/update/{inbound_id}")
+
+        last_error: Exception | None = None
+
+        for kwargs in (
+            {"json": payload},
+            {"data": payload},
+        ):
+            try:
+                response = client.post(url, **kwargs)
+                self._extract_3xui_obj(response)
+                return
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+
+        raise RuntimeError(f"Failed to update hysteria inbound {inbound_id}: {last_error}")
+
     def list_client_configs(self) -> list[DiscoveredClientConfig]:
         """
         Возвращает список конфигов с сервера.
@@ -354,7 +501,10 @@ class XuiAdapter:
         Для VLESS/VMess/Trojan:
           один client = один DiscoveredClientConfig.
 
-        Для Hysteria/Hysteria2 и других inbound-only:
+        Для Hysteria/Hysteria2:
+          если в settings.clients есть клиенты, один client = один DiscoveredClientConfig.
+
+        Для inbound-only протоколов:
           один inbound = один DiscoveredClientConfig с client_uuid=None.
 
         Трафик client-based конфигов берём из inbound.clientStats,
@@ -377,7 +527,6 @@ class XuiAdapter:
             clients = _get_clients_from_inbound(inbound)
             client_stats = _get_client_stats_from_inbound(inbound)
 
-            # Case 1: обычные inbound'ы с clients.
             if clients:
                 for client in clients:
                     client_uuid = _get_attr(client, "id", "uuid")
@@ -409,7 +558,6 @@ class XuiAdapter:
 
                 continue
 
-            # Case 2: inbound-only протоколы, например hysteria/hysteria2.
             discovered.append(
                 DiscoveredClientConfig(
                     inbound_id=int(inbound_id),
@@ -441,6 +589,9 @@ class XuiAdapter:
         """
         Разные версии py3xui могут иметь разные сигнатуры inbound.update.
         Пробуем несколько вариантов.
+
+        Не использовать для Hysteria/Hysteria2 clients,
+        потому что py3xui может потерять settings.clients[].password.
         """
         try:
             api.inbound.update(inbound_id, inbound)
@@ -454,107 +605,125 @@ class XuiAdapter:
         except TypeError:
             pass
 
-        # Последний вариант — пусть реальная ошибка всплывёт наружу.
         api.inbound.update(inbound_id, inbound)
 
     def _set_hysteria_subscription_fields(
-            self,
-            *,
-            api: Any,
-            inbound: Any,
-            inbound_id: int,
-            client_email: str | None,
-            client_uuid: str | None,
-            sub_id: str,
-            expiry_time: int | None,
-            total_gb: int | None,
-            enable: bool | None,
+        self,
+        *,
+        inbound_id: int,
+        client_email: str | None,
+        client_uuid: str | None,
+        sub_id: str,
+        expiry_time: int | None,
+        total_gb: int | None,
+        enable: bool | None,
     ) -> str:
         """
-        Hysteria/Hysteria2 в 3x-ui обновляем через inbound.settings.clients.
+        Hysteria/Hysteria2 обновляем только через raw 3x-ui API.
 
-        Важно:
-        clients внутри settings могут быть pydantic/py3xui объектами.
-        Поэтому нельзя превращать settings в JSON-строку перед inbound.update().
+        Почему:
+        password клиента лежит в settings.clients[].password.
+        При обновлении через py3xui object это поле может исчезнуть,
+        после чего 3x-ui начинает отдавать подписки без password.
+
+        Поэтому здесь:
+        - читаем inbound raw;
+        - ищем клиента по uuid/email;
+        - меняем только subId / expiryTime / totalGB / enable;
+        - password и остальные поля не трогаем;
+        - отправляем весь inbound обратно raw payload'ом.
         """
-        settings_obj = _get_attr(inbound, "settings", default=None)
-        settings_dict = _get_inbound_settings(inbound)
-        clients = settings_dict.get("clients") or []
+        with self._login_http_client() as http_client:
+            inbound_raw = self._fetch_inbound_raw_via_http(http_client, inbound_id)
 
-        if not isinstance(clients, list):
-            raise ValueError(f"Inbound {inbound_id} settings.clients is not a list")
+            settings = inbound_raw.get("settings") or {}
+            settings = _parse_3xui_json_field(settings)
 
-        found_index: int | None = None
-        found_client: Any | None = None
+            if not isinstance(settings, dict):
+                raise ValueError(f"Inbound {inbound_id} settings is not a dict")
 
-        for index, candidate in enumerate(clients):
-            candidate_uuid = _get_attr(candidate, "id", "uuid")
-            candidate_email = _get_attr(candidate, "email")
+            clients = settings.get("clients") or []
 
-            if client_uuid and candidate_uuid and str(candidate_uuid) == client_uuid:
-                found_index = index
-                found_client = candidate
-                break
+            if not isinstance(clients, list):
+                raise ValueError(f"Inbound {inbound_id} settings.clients is not a list")
 
-            if client_email and candidate_email == client_email:
-                found_index = index
-                found_client = candidate
-                break
+            found_client: dict[str, Any] | None = None
 
-        if found_index is None or found_client is None:
-            raise ValueError(
-                f"Hysteria client not found in inbound {inbound_id}: "
-                f"email={client_email!r}, uuid={client_uuid!r}"
+            for index, candidate in enumerate(clients):
+                if not isinstance(candidate, dict):
+                    candidate = _as_dict(candidate)
+                    clients[index] = candidate
+
+                candidate_uuid = candidate.get("id") or candidate.get("uuid")
+                candidate_email = candidate.get("email")
+
+                if client_uuid and candidate_uuid and str(candidate_uuid) == str(client_uuid):
+                    found_client = candidate
+                    break
+
+                if client_email and candidate_email and str(candidate_email) == str(client_email):
+                    found_client = candidate
+                    break
+
+            if found_client is None:
+                raise ValueError(
+                    f"Hysteria client not found in inbound {inbound_id}: "
+                    f"email={client_email!r}, uuid={client_uuid!r}"
+                )
+
+            _set_dict_alias(
+                found_client,
+                ("subId", "sub_id"),
+                sub_id,
+                default_name="subId",
             )
 
-        patched_client_dict = _patch_client_dict_for_subscription(
-            found_client,
-            sub_id=sub_id,
-            expiry_time=expiry_time,
-            total_gb=total_gb,
-            enable=enable,
-        )
+            if expiry_time is not None:
+                _set_dict_alias(
+                    found_client,
+                    ("expiryTime", "expiry_time"),
+                    expiry_time,
+                    default_name="expiryTime",
+                )
 
-        # Если settings_obj.clients содержит реальные объекты, патчим объект на месте.
-        original_clients = _get_attr(settings_obj, "clients", default=None)
+            if total_gb is not None:
+                _set_dict_alias(
+                    found_client,
+                    ("totalGB", "total_gb"),
+                    total_gb,
+                    default_name="totalGB",
+                )
 
-        if isinstance(original_clients, list) and found_index < len(original_clients):
-            original_client_obj = original_clients[found_index]
+            if enable is not None:
+                _set_dict_alias(
+                    found_client,
+                    ("enable", "enabled"),
+                    enable,
+                    default_name="enable",
+                )
 
-            if isinstance(original_client_obj, dict):
-                original_client_obj.clear()
-                original_client_obj.update(patched_client_dict)
-            else:
-                for key, value in patched_client_dict.items():
-                    try:
-                        setattr(original_client_obj, key, value)
-                    except Exception:
-                        pass
+            settings["clients"] = clients
+            inbound_raw["settings"] = settings
 
-            # оставляем settings_obj как объект py3xui/pydantic
-            setattr(settings_obj, "clients", original_clients)
+            self._update_inbound_raw_via_http(
+                http_client,
+                inbound_id,
+                inbound_raw,
+            )
 
-        else:
-            # fallback для dict/string settings
-            clients[found_index] = patched_client_dict
-            settings_dict["clients"] = clients
-            _set_inbound_settings(inbound, settings_dict)
-
-        self._update_inbound_object(api, inbound_id, inbound)
-
-        effective_uuid = _get_attr(found_client, "id", "uuid")
-        return str(effective_uuid or client_email)
+            effective_uuid = found_client.get("id") or found_client.get("uuid")
+            return str(effective_uuid or "")
 
     def set_client_subscription_fields(
-            self,
-            *,
-            inbound_id: int,
-            client_email: str | None,
-            client_uuid: str | None,
-            sub_id: str,
-            expiry_time: int | None = None,
-            total_gb: int | None = None,
-            enable: bool | None = True,
+        self,
+        *,
+        inbound_id: int,
+        client_email: str | None,
+        client_uuid: str | None,
+        sub_id: str,
+        expiry_time: int | None = None,
+        total_gb: int | None = None,
+        enable: bool | None = True,
     ) -> str:
         """Set subId plus optional expiry/traffic/enabled fields.
 
@@ -562,7 +731,7 @@ class XuiAdapter:
           обновляем через api.client.update()
 
         Hysteria/Hysteria2:
-          обновляем через inbound.settings.clients + api.inbound.update()
+          обновляем через raw inbound update, чтобы не потерять password.
         """
         if not client_email and not client_uuid:
             raise ValueError("client_email or client_uuid is required")
@@ -574,8 +743,6 @@ class XuiAdapter:
 
         if inbound_protocol in {"hysteria", "hysteria2", "hy2"}:
             return self._set_hysteria_subscription_fields(
-                api=api,
-                inbound=inbound,
                 inbound_id=inbound_id,
                 client_email=client_email,
                 client_uuid=client_uuid,
@@ -694,11 +861,11 @@ class XuiAdapter:
         return links
 
     def clear_client_sub_id(
-            self,
-            *,
-            inbound_id: int,
-            client_email: str | None,
-            client_uuid: str | None,
+        self,
+        *,
+        inbound_id: int,
+        client_email: str | None,
+        client_uuid: str | None,
     ) -> str:
         return self.set_client_subscription_fields(
             inbound_id=inbound_id,

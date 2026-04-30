@@ -461,7 +461,8 @@ def apply_subscription(subscription_id: str, db: Session = Depends(get_db)):
                 total_gb=subscription.traffic_limit,
                 enable=subscription.status.value == "active",
             )
-            item.client_uuid = effective_uuid
+            if effective_uuid:
+                item.client_uuid = effective_uuid
             item.status = ItemStatus.synced
             item.last_error = None
             item.last_sync_at = now_utc()

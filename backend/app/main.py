@@ -1,11 +1,9 @@
 from fastapi import Depends, FastAPI
 
 from app.auth import require_admin
-from app.db import Base, engine
 from app.errors import install_error_handlers
 from app.routers import audit, auth, public_sub, servers, subscriptions, users
 
-Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Central 3x-ui Manager", version="0.5.0")
 install_error_handlers(app)

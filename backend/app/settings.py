@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     jwt_secret: SecretStr = SecretStr("change-me-in-production")
     admin_token_ttl_seconds: int = 60 * 60 * 12
 
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file="../.env", extra="ignore")
 
 
 settings = Settings()

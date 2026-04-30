@@ -194,6 +194,22 @@ def _get_clients_from_inbound(inbound: Any) -> list[Any]:
     return []
 
 
+def _get_client_stats_from_inbound(inbound: Any) -> dict[str, dict[str, int]]:
+    raw = _inbound_to_raw(inbound)
+    stats = raw.get("clientStats") or raw.get("client_stats") or []
+
+    result = {}
+    for stat in stats:
+        email = stat.get("email")
+        if email:
+            result[str(email)] = {
+                "up": int(stat.get("up") or 0),
+                "down": int(stat.get("down") or 0),
+            }
+
+    return result
+
+
 def _find_client(
     clients: list[Any],
     *,
@@ -335,16 +351,14 @@ class XuiAdapter:
         """
         Возвращает список конфигов с сервера.
 
-        Важное изменение:
-        - больше НЕ фильтруем протоколы;
-        - больше НЕ пропускаем inbound без settings.clients;
-        - inbound-only протоколы вроде hysteria/hysteria2 тоже попадают в список.
-
         Для VLESS/VMess/Trojan:
           один client = один DiscoveredClientConfig.
 
         Для Hysteria/Hysteria2 и других inbound-only:
           один inbound = один DiscoveredClientConfig с client_uuid=None.
+
+        Трафик client-based конфигов берём из inbound.clientStats,
+        потому что в settings.clients[] up/down часто отсутствуют.
         """
         api = self._api()
         inbounds = api.inbound.get_list()
@@ -361,6 +375,7 @@ class XuiAdapter:
             inbound_raw = _inbound_to_raw(inbound)
 
             clients = _get_clients_from_inbound(inbound)
+            client_stats = _get_client_stats_from_inbound(inbound)
 
             # Case 1: обычные inbound'ы с clients.
             if clients:
@@ -368,8 +383,8 @@ class XuiAdapter:
                     client_uuid = _get_attr(client, "id", "uuid")
                     client_email = _get_attr(client, "email")
 
-                    # Если у client почему-то нет uuid/email, всё равно не валим импорт.
-                    # Но такой config нельзя будет apply'нуть как client-based.
+                    stats = client_stats.get(str(client_email)) if client_email else None
+
                     discovered.append(
                         DiscoveredClientConfig(
                             inbound_id=int(inbound_id),
@@ -382,11 +397,12 @@ class XuiAdapter:
                             client_enable=_get_attr(client, "enable", "enabled"),
                             client_expiry_time=_get_attr(client, "expiry_time", "expiryTime"),
                             client_total_gb=_get_attr(client, "total_gb", "totalGB"),
-                            client_up=_get_attr(client, "up", default=0),
-                            client_down=_get_attr(client, "down", default=0),
+                            client_up=(stats or {}).get("up", _get_attr(client, "up", default=0)),
+                            client_down=(stats or {}).get("down", _get_attr(client, "down", default=0)),
                             raw={
                                 "inbound": inbound_raw,
                                 "client": _as_dict(client),
+                                "client_stats": stats,
                             },
                         )
                     )

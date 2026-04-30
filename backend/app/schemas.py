@@ -304,3 +304,11 @@ class AuditLogRead(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class VlessConvertRequest(BaseModel):
+    url: str
+
+
+class VlessConvertResponse(BaseModel):
+    outbound: dict

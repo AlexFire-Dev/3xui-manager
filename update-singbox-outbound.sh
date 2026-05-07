@@ -130,12 +130,15 @@ jq -e --arg flow "$VLESS_FLOW" '
   .outbound
 
   # sing-box не принимает transport.type = "tcp".
-  # Для обычного TCP нужно удалить transport и поставить network = "tcp".
+  # Для обычного TCP удаляем transport, но НЕ добавляем network = "tcp".
   | if .transport.type == "tcp" then
-      .network = "tcp" | del(.transport)
+      del(.transport)
     else
       .
     end
+
+  # На всякий случай удаляем network, если его добавил конвертер.
+  | del(.network)
 
   # Если flow был в VLESS-ссылке, но конвертер его не добавил — добавляем.
   | if ($flow != "" and (.flow == null or .flow == "")) then

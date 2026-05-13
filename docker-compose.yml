@@ -7,6 +7,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    restart: unless-stopped
     ports:
       - "${POSTGRES_PORT}:5432"
     volumes:
@@ -25,6 +26,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    restart: unless-stopped
     ports:
       - "${API_PORT}:8000"
     volumes:
@@ -38,6 +40,24 @@ services:
       - api
     ports:
       - "${FRONTEND_PORT}:80"
+    restart: unless-stopped
+
+  telegram-bot:
+    build:
+      context: ./telegram-bot
+    env_file:
+      - .env
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      BOT_API_BASE_URL: ${BOT_API_BASE_URL:-http://api:8000}
+      BOT_PUBLIC_SUB_BASE_URL: ${BOT_PUBLIC_SUB_BASE_URL:-${PUBLIC_BASE_URL}}
+      BOT_ADMIN_USERNAME: ${BOT_ADMIN_USERNAME:-${ADMIN_USERNAME}}
+      BOT_ADMIN_PASSWORD: ${BOT_ADMIN_PASSWORD:-${ADMIN_PASSWORD}}
+      BOT_REQUEST_TIMEOUT_SECONDS: ${BOT_REQUEST_TIMEOUT_SECONDS:-30}
+      BOT_TRAFFIC_REFRESH: ${BOT_TRAFFIC_REFRESH:-true}
+    depends_on:
+      - api
+    restart: unless-stopped
 
 volumes:
   postgres_data:

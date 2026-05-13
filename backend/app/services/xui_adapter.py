@@ -881,3 +881,32 @@ class XuiAdapter:
             total_gb=None,
             enable=None,
         )
+
+    def reset_all_client_traffics(self) -> list[int]:
+        api = self._api()
+        inbound_ids: list[int] = []
+
+        for inbound in api.inbound.get_list():
+            inbound_id = _get_attr(inbound, "id")
+            if inbound_id is not None:
+                inbound_ids.append(int(inbound_id))
+
+        client = self._login_http_client()
+        try:
+            for inbound_id in inbound_ids:
+                response = client.post(
+                    self._panel_url(f"/panel/api/inbounds/resetAllClientTraffics/{inbound_id}")
+                )
+                self._extract_3xui_obj(response)
+        finally:
+            client.close()
+
+        return inbound_ids
+
+    def reset_all_panel_traffics(self) -> None:
+        client = self._login_http_client()
+        try:
+            response = client.post(self._panel_url("/panel/api/inbounds/resetAllTraffics"))
+            self._extract_3xui_obj(response)
+        finally:
+            client.close()

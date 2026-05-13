@@ -1,8 +1,8 @@
 import enum
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, String, Text, UniqueConstraint, BigInteger
+from sqlalchemy import Boolean, Date, DateTime, Enum, ForeignKey, Integer, String, Text, UniqueConstraint, BigInteger
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -55,6 +55,10 @@ class AuditEventType(str, enum.Enum):
     cache_refreshed = "cache_refreshed"
     cache_cleared = "cache_cleared"
     traffic_read = "traffic_read"
+    daily_traffic_snapshot_created = "daily_traffic_snapshot_created"
+    traffic_reset = "traffic_reset"
+    maintenance_started = "maintenance_started"
+    maintenance_finished = "maintenance_finished"
 
 
 class User(Base):
@@ -191,6 +195,66 @@ class SubscriptionSourceCache(Base):
 
     subscription: Mapped[Subscription] = relationship(back_populates="source_caches")
     server: Mapped[Server] = relationship()
+
+
+class MaintenanceRun(Base):
+    __tablename__ = "maintenance_runs"
+    __table_args__ = (
+        UniqueConstraint("run_type", "run_date", name="uq_maintenance_run_type_date"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    run_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    run_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="started", index=True)
+    last_step: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    payload_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class DailyTrafficSnapshot(Base):
+    __tablename__ = "daily_traffic_snapshots"
+    __table_args__ = (
+        UniqueConstraint("snapshot_date", "snapshot_type", "traffic_key", name="uq_daily_traffic_snapshot_identity"),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    snapshot_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    snapshot_type: Mapped[str] = mapped_column(String(32), nullable=False, default="daily_reset", index=True)
+    snapshot_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, index=True)
+
+    user_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    user_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    user_telegram_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+
+    subscription_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    subscription_title: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    subscription_token: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    subscription_item_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    server_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    server_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    inbound_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    inbound_remark: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    inbound_protocol: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    client_email: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    client_uuid: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+
+    remote_config_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    remote_config_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    up: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    down: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    total: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+
+    traffic_key: Mapped[str] = mapped_column(String(512), nullable=False, index=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
 
 
 class AuditLog(Base):

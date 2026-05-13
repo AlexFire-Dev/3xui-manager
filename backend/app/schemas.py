@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 
 from pydantic import BaseModel, Field, HttpUrl, model_validator
 
@@ -292,6 +292,57 @@ class SourceCacheRead(BaseModel):
     last_error: str | None
 
     model_config = {"from_attributes": True}
+
+
+class DailyTrafficSnapshotRead(BaseModel):
+    id: str
+    snapshot_date: date
+    snapshot_type: str
+    snapshot_at: datetime
+    user_id: str | None
+    user_name: str | None
+    user_telegram_id: str | None
+    subscription_id: str | None
+    subscription_title: str | None
+    subscription_token: str | None
+    subscription_item_id: str | None
+    server_id: str | None
+    server_name: str | None
+    inbound_id: int | None
+    inbound_remark: str | None
+    inbound_protocol: str | None
+    client_email: str | None
+    client_uuid: str | None
+    remote_config_id: str | None
+    remote_config_status: str | None
+    up: int
+    down: int
+    total: int
+    traffic_key: str
+
+    model_config = {"from_attributes": True}
+
+
+class DailyTrafficSummaryBucket(BaseModel):
+    key: str
+    title: str | None = None
+    up: int
+    down: int
+    total: int
+    items: int
+
+
+class DailyTrafficSummary(BaseModel):
+    date_from: date | None = None
+    date_to: date | None = None
+    user_id: str | None = None
+    telegram_id: str | None = None
+    up: int
+    down: int
+    total: int
+    items: int
+    by_subscription: list[DailyTrafficSummaryBucket]
+    by_server: list[DailyTrafficSummaryBucket]
 
 
 class AuditLogRead(BaseModel):

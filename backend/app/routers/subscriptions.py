@@ -3,6 +3,7 @@ from collections import defaultdict
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.orm import Session, joinedload, selectinload
 
+from app.services.traffic_stats import collect_subscription_traffic_items
 
 from app.db import get_db
 from app.models import (
@@ -565,16 +566,84 @@ async def preview_subscription_text(
 @router.get("/{subscription_id}/traffic", response_model=TrafficResult)
 def subscription_traffic(subscription_id: str, refresh: bool = True, db: Session = Depends(get_db)):
     subscription = get_subscription_or_404(db, subscription_id)
+
     if refresh:
-        servers = {item.server_id: item.server for item in subscription.items if item.server}
+        servers = {
+            item.server_id: item.server
+            for item in subscription.items
+            if item.server
+        }
+
         for server in servers.values():
             if server.status != ServerStatus.active:
                 continue
+
             try:
                 from app.routers.servers import refresh_configs
+
                 refresh_configs(server.id, db)
             except Exception:
                 pass
+
+        # После refresh_configs внутри есть db.commit().
+        # Поэтому лучше сбросить ORM cache и заново достать подписку.
+        db.expire_all()
+        subscription = get_subscription_or_404(db, subscription_id)
+
+    by_server: dict[str, dict] = defaultdict(
+        lambda: {
+            "up": 0,
+            "down": 0,
+            "items": 0,
+            "server_name": "",
+        }
+    )
+
+    total_up = 0
+    total_down = 0
+
+    for usage in collect_subscription_traffic_items(db, subscription):
+        item = usage.item
+        server_name = item.server.name if item.server else item.server_id
+
+        by_server[item.server_id]["server_name"] = server_name
+        by_server[item.server_id]["up"] += usage.up
+        by_server[item.server_id]["down"] += usage.down
+        by_server[item.server_id]["items"] += 1
+
+        total_up += usage.up
+        total_down += usage.down
+
+    breakdown = [
+        TrafficServerBreakdown(
+            server_id=server_id,
+            server_name=data["server_name"],
+            up=data["up"],
+            down=data["down"],
+            total=data["up"] + data["down"],
+            items=data["items"],
+        )
+        for server_id, data in by_server.items()
+    ]
+
+    audit(
+        db,
+        AuditEventType.traffic_read,
+        f"Traffic read for subscription {subscription.id}",
+        entity_type="subscription",
+        entity_id=subscription.id,
+    )
+
+    db.commit()
+
+    return TrafficResult(
+        subscription_id=subscription.id,
+        up=total_up,
+        down=total_down,
+        total=total_up + total_down,
+        limit=subscription.traffic_limit,
+        breakdown=breakdown,
+    )
 
     by_server: dict[str, dict] = defaultdict(lambda: {"up": 0, "down": 0, "items": 0, "server_name": ""})
     total_up = 0

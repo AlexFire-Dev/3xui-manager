@@ -33,6 +33,19 @@ services:
       - ./backend:/app
     command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
 
+  maintenance:
+    build:
+      context: ./backend
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+    command: sh -c "alembic upgrade head && python -m app.maintenance_worker"
+    restart: unless-stopped
+
   frontend:
     build:
       context: ./frontend

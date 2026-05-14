@@ -173,8 +173,11 @@ fi
 
 cp "$NEW_CONFIG" "$CONFIG"
 
+sleep 10
+
 echo "Restarting $SERVICE..."
 if /etc/init.d/"$SERVICE" restart; then
+  sleep 15
   echo "Restarting OpenWrt network..."
   /etc/init.d/network restart
 else

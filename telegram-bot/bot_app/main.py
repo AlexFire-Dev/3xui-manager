@@ -76,8 +76,14 @@ def _find_subscription(subscriptions: list[Subscription], subscription_id: str) 
     return next((item for item in subscriptions if item.id == subscription_id), None)
 
 
-async def _send_stats(message: Message, *, edit: bool = False) -> None:
-    context = await _resolve_user_context(message)
+async def _send_stats(
+    message: Message,
+    *,
+    identity_source: Message | CallbackQuery | None = None,
+    edit: bool = False,
+) -> None:
+    context = await _resolve_user_context(identity_source or message)
+
     if isinstance(context, str):
         if edit:
             await message.edit_text(context)
@@ -123,7 +129,7 @@ async def callback_refresh(callback: CallbackQuery) -> None:
     if not isinstance(callback.message, Message):
         return
     try:
-        await _send_stats(callback.message, edit=True)
+        await _send_stats(callback.message, identity_source=callback, edit=True)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Failed to refresh stats")
         await callback.message.answer(f"Не удалось обновить статистику:\n<code>{str(exc)}</code>")

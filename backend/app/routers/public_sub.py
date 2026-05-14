@@ -54,6 +54,10 @@ async def get_public_subscription(
     if expires_at and expires_at < utc_now():
         return Response(content="", media_type="text/plain")
 
+    # Last successful public request for this subscription.
+    # Обновляем после проверки, что подписка активна и не истекла.
+    subscription.last_requested_at = now_utc()
+
     if hwid:
         normalized_hwid = hwid.strip()[:255]
 

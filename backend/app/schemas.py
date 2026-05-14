@@ -173,6 +173,7 @@ class SubscriptionRead(BaseModel):
     expires_at: datetime | None
     traffic_limit: int | None
     created_at: datetime
+    last_requested_at: datetime | None = None
 
     model_config = {"from_attributes": True}
 

@@ -142,8 +142,34 @@ def _get_client_stats_from_inbound(inbound: Any) -> dict[str, dict[str, int]]:
 
 
 def _client_identity(client: dict[str, Any]) -> str | None:
-    value = client.get("uuid") or client.get("id") or client.get("password") or client.get("auth")
-    return str(value) if value else None
+    """Return the proxy credential/identity, not the 3x-ui DB row id.
+
+    Important for 3x-ui v3:
+    - /panel/api/clients/get/:email returns client.id as the numeric DB row id.
+    - In inbound settings for VLESS/VMess, client.id may still be the proxy UUID.
+    - Password-based protocols use password/auth instead of UUID.
+
+    So we prefer explicit credential fields and only use id when it looks like
+    a protocol identity, not when it is an int-like DB id such as 16.
+    """
+    for key in ("uuid", "password", "auth"):
+        value = client.get(key)
+        if value:
+            return str(value)
+
+    value = client.get("id")
+    if value is None:
+        return None
+
+    # In 3x-ui v3 client API, id=16 means DB row id, not proxy identity.
+    if isinstance(value, int):
+        return None
+
+    text = str(value).strip()
+    if not text or text.isdigit():
+        return None
+
+    return text
 
 
 def _client_sub_id(client: dict[str, Any]) -> str | None:
@@ -164,6 +190,70 @@ def _client_expiry_time(client: dict[str, Any]) -> int | None:
 def _client_total_gb(client: dict[str, Any]) -> int | None:
     value = client.get("totalGB", client.get("total_gb"))
     return int(value) if value is not None else None
+
+
+def _sanitize_client_update_payload(client_data: dict[str, Any]) -> dict[str, Any]:
+    """Build a safe payload for /panel/api/clients/update/:email.
+
+    3x-ui v3 has two different meanings around `id`:
+    - /clients/get/:email may return `id` as the numeric DB row id.
+    - /clients/update/:email expects `client.id` to be a string when present
+      (historically the VLESS/VMess UUID field in settings.clients[]).
+
+    Round-tripping the GET object directly therefore breaks with:
+      json: cannot unmarshal number into Go struct field Client.id of type string
+
+    This function removes API/read-only fields and ensures `id`, when sent, is
+    never numeric. Existing secrets are preserved through `uuid`, `password`, or
+    `auth` when the panel returned them.
+    """
+    payload = deepcopy(client_data)
+
+    # These fields are response metadata / computed fields, not client payload.
+    for key in (
+        "traffic",
+        "inboundIds",
+        "inbound_ids",
+        "createdAt",
+        "updatedAt",
+        "created_at",
+        "updated_at",
+        "lastOnline",
+        "online",
+    ):
+        payload.pop(key, None)
+
+    raw_id = payload.get("id")
+    uuid_value = payload.get("uuid")
+
+    # If id is a numeric row id, never send it back to update.
+    if isinstance(raw_id, int) or (isinstance(raw_id, str) and raw_id.strip().isdigit()):
+        payload.pop("id", None)
+
+        # Some 3x-ui builds still expect the protocol UUID under `id`.
+        # If `uuid` is available, use it as string `id` as well.
+        if uuid_value:
+            payload["id"] = str(uuid_value)
+
+    elif raw_id is not None:
+        payload["id"] = str(raw_id)
+
+    # Normalize common scalar fields to the types expected by the API.
+    for key in ("uuid", "password", "auth", "email", "subId", "comment", "flow"):
+        if key in payload and payload[key] is not None:
+            payload[key] = str(payload[key])
+
+    for key in ("totalGB", "expiryTime", "limitIp", "tgId", "reset"):
+        if key in payload and payload[key] is not None:
+            try:
+                payload[key] = int(payload[key])
+            except (TypeError, ValueError):
+                payload.pop(key, None)
+
+    if "enable" in payload and payload["enable"] is not None:
+        payload["enable"] = bool(payload["enable"])
+
+    return payload
 
 
 def _quote_path(value: str) -> str:
@@ -389,20 +479,16 @@ class XuiAdapter:
         try:
             client_data, inbound_ids = self._get_client_by_email(client, client_email)
 
-            if client_uuid:
-                current_identity = _client_identity(client_data)
-                # Do not fail on password-based protocols where the central DB may
-                # store password/auth instead of uuid. This check is only a guard
-                # against obviously wrong updates when both sides expose a UUID.
-                if current_identity and str(current_identity) != str(client_uuid):
-                    raw_id = client_data.get("id") or client_data.get("uuid")
-                    if raw_id and str(raw_id) != str(client_uuid):
-                        raise ValueError(
-                            f"Client identity mismatch for {client_email}: "
-                            f"panel={raw_id!r}, expected={client_uuid!r}"
-                        )
+            # Do not compare client_uuid with client_data["id"] here.
+            # In 3x-ui v3 /clients/get/:email, client.id is the numeric DB row id
+            # (for example 16), while our RemoteConfig.client_uuid stores the
+            # proxy credential: UUID/password/auth. The email is the stable v3
+            # identifier, and /clients/update/:email is intentionally keyed by it.
+            #
+            # A stale/missing client is still handled correctly by /clients/get/:email
+            # returning "record not found" before this point.
 
-            payload = deepcopy(client_data)
+            payload = _sanitize_client_update_payload(client_data)
             payload["email"] = client_email
             payload["subId"] = sub_id
 
@@ -415,10 +501,8 @@ class XuiAdapter:
             if enable is not None:
                 payload["enable"] = enable
 
-            # Some 3x-ui builds ignore this on update, some accept it. Keeping it
-            # prevents accidental detach if a build expects the field.
-            if inbound_ids:
-                payload["inboundIds"] = inbound_ids
+            # Do not send inboundIds or numeric DB id to /clients/update.
+            # Attach/detach is managed by dedicated endpoints in 3x-ui v3.
 
             self._extract_3xui_obj(
                 client.post(
@@ -427,7 +511,7 @@ class XuiAdapter:
                 )
             )
 
-            return str(payload.get("uuid") or payload.get("id") or client_uuid or client_email)
+            return str(_client_identity(payload) or client_uuid or client_email)
 
         finally:
             client.close()

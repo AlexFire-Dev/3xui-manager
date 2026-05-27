@@ -4,6 +4,7 @@ import json
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -17,6 +18,10 @@ class XuiServerConfig:
     panel_password: str
     subscription_base_url: str
     use_tls_verify: bool = True
+    # Optional explicit 3x-ui v3 API token.
+    # If it is not provided, panel_password from the existing DB field is used
+    # as the Bearer token. panel_username is intentionally ignored.
+    api_token: str | None = None
 
 
 @dataclass
@@ -26,8 +31,6 @@ class DiscoveredClientConfig:
     inbound_protocol: str | None
     inbound_port: int | None
 
-    # Для обычных client-based протоколов: VLESS / VMess / Trojan и т.д.
-    # Для inbound-only протоколов вроде Hysteria может быть None.
     client_uuid: str | None
     client_email: str | None
     client_sub_id: str | None
@@ -40,77 +43,8 @@ class DiscoveredClientConfig:
     raw: dict[str, Any]
 
 
-def _get_attr(obj: Any, *names: str, default: Any = None) -> Any:
-    for name in names:
-        if obj is None:
-            continue
-
-        if isinstance(obj, dict) and name in obj:
-            return obj[name]
-
-        if hasattr(obj, name):
-            return getattr(obj, name)
-
-    return default
-
-
-def _set_existing_or_first_attr(obj: Any, names: tuple[str, ...], value: Any) -> None:
-    """
-    Аккуратно выставляет поле на объекте py3xui.
-
-    Если у объекта уже есть одно из имён — меняем его.
-    Если нет — ставим первое имя.
-
-    Это нужно из-за различий:
-      sub_id vs subId
-      expiry_time vs expiryTime
-      total_gb vs totalGB
-      enable vs enabled
-    """
-    for name in names:
-        if hasattr(obj, name):
-            setattr(obj, name, value)
-            return
-
-    setattr(obj, names[0], value)
-
-
-def _set_inbound_settings(inbound: Any, settings: dict[str, Any]) -> None:
-    """
-    Обновляет inbound.settings, сохраняя формат, который ожидает py3xui.
-
-    В текущей версии py3xui inbound.update() ожидает не JSON-строку,
-    а объект settings, у которого есть model_dump_json().
-    Поэтому, если исходный settings был объектом py3xui/pydantic,
-    патчим его clients на месте.
-    """
-    current_settings = _get_attr(inbound, "settings", default=None)
-
-    if isinstance(current_settings, dict):
-        current_settings.clear()
-        current_settings.update(settings)
-        return
-
-    if hasattr(current_settings, "clients"):
-        setattr(current_settings, "clients", settings.get("clients", []))
-        return
-
-    if isinstance(inbound, dict):
-        inbound["settings"] = settings
-        return
-
-    setattr(inbound, "settings", settings)
-
-
 def _as_dict(value: Any) -> dict[str, Any]:
-    """
-    Универсально превращает объект py3xui / pydantic / dict / json-string в dict.
-
-    Важно:
-    - возвращаем deepcopy, чтобы не мутировать исходный объект случайно;
-    - поддерживаем settings как строку JSON;
-    - поддерживаем pydantic v1/v2.
-    """
+    """Convert dict / pydantic model / object / JSON string to a plain dict."""
     if value is None:
         return {}
 
@@ -145,197 +79,8 @@ def _as_dict(value: Any) -> dict[str, Any]:
     return {"value": str(value)}
 
 
-def _maybe_json(value: Any) -> Any:
-    """
-    Для raw-полей inbound'а.
-
-    В 3x-ui часть полей часто приходит JSON-строкой:
-      settings
-      streamSettings
-      sniffing
-      allocate
-
-    Чтобы в БД raw был полезным, пытаемся их распарсить.
-    """
-    if not isinstance(value, str):
-        return value
-
-    try:
-        return json.loads(value)
-    except json.JSONDecodeError:
-        return value
-
-
-def _inbound_to_raw(inbound: Any) -> dict[str, Any]:
-    raw = _as_dict(inbound)
-
-    for key in ("settings", "streamSettings", "sniffing", "allocate"):
-        if key in raw:
-            raw[key] = _maybe_json(raw[key])
-
-    return raw
-
-
-def _get_inbound_settings(inbound: Any) -> dict[str, Any]:
-    settings = _get_attr(inbound, "settings", default={})
-    return _as_dict(settings)
-
-
-def _get_clients_from_inbound(inbound: Any) -> list[Any]:
-    settings = _get_inbound_settings(inbound)
-    clients = settings.get("clients", [])
-
-    if clients is None:
-        return []
-
-    if isinstance(clients, list):
-        return clients
-
-    return []
-
-
-def _get_client_stats_from_inbound(inbound: Any) -> dict[str, dict[str, int]]:
-    raw = _inbound_to_raw(inbound)
-    stats = raw.get("clientStats") or raw.get("client_stats") or []
-
-    result = {}
-    for stat in stats:
-        email = stat.get("email")
-        if email:
-            result[str(email)] = {
-                "up": int(stat.get("up") or 0),
-                "down": int(stat.get("down") or 0),
-            }
-
-    return result
-
-
-def _find_client(
-    clients: list[Any],
-    *,
-    client_email: str | None,
-    client_uuid: str | None,
-) -> Any | None:
-    for candidate in clients:
-        candidate_uuid = str(_get_attr(candidate, "id", "uuid", default="") or "")
-        candidate_email = _get_attr(candidate, "email")
-
-        if client_uuid and candidate_uuid == client_uuid:
-            return candidate
-
-        if client_email and candidate_email == client_email:
-            return candidate
-
-    return None
-
-
-def _patch_client_dict_for_subscription(
-    existing_client: Any,
-    *,
-    sub_id: str,
-    expiry_time: int | None,
-    total_gb: int | None,
-    enable: bool | None,
-) -> dict[str, Any]:
-    """
-    Patch для клиентов внутри inbound.settings.clients.
-
-    Нужен для hysteria/hysteria2, где client.id / client.uuid может быть null,
-    и api.client.update() не подходит.
-    """
-    client_data = _as_dict(existing_client)
-
-    client_data["sub_id"] = sub_id
-    client_data["subId"] = sub_id
-
-    if expiry_time is not None:
-        client_data["expiry_time"] = expiry_time
-        client_data["expiryTime"] = expiry_time
-
-    if total_gb is not None:
-        client_data["total_gb"] = total_gb
-        client_data["totalGB"] = total_gb
-
-    if enable is not None:
-        client_data["enable"] = enable
-        client_data["enabled"] = enable
-
-    return client_data
-
-
-def _patch_client_for_subscription(
-    existing_client: Any,
-    *,
-    effective_uuid: str,
-    sub_id: str,
-    expiry_time: int | None,
-    total_gb: int | None,
-    enable: bool | None,
-) -> Any:
-    """
-    Патчит существующего клиента, НЕ создавая его заново.
-
-    Это критично.
-
-    Старый баг:
-      apply собирал client object с нуля и отправлял его в 3x-ui.
-      Из-за этого терялись поля вроде:
-        flow
-        limitIp
-        tgId
-        reset
-        comment
-        security-related custom fields
-
-    Новая логика:
-      берём существующего клиента;
-      меняем только:
-        subId
-        expiryTime
-        totalGB
-        enable;
-      всё остальное оставляем как было.
-    """
-    patched = deepcopy(existing_client)
-
-    if effective_uuid:
-        _set_existing_or_first_attr(patched, ("id", "uuid"), effective_uuid)
-    _set_existing_or_first_attr(patched, ("sub_id", "subId"), sub_id)
-
-    if expiry_time is not None:
-        _set_existing_or_first_attr(patched, ("expiry_time", "expiryTime"), expiry_time)
-
-    if total_gb is not None:
-        _set_existing_or_first_attr(patched, ("total_gb", "totalGB"), total_gb)
-
-    if enable is not None:
-        _set_existing_or_first_attr(patched, ("enable", "enabled"), enable)
-
-    return patched
-
-
-def _set_dict_alias(
-    data: dict[str, Any],
-    names: tuple[str, ...],
-    value: Any,
-    *,
-    default_name: str,
-) -> None:
-    for name in names:
-        if name in data:
-            data[name] = value
-            return
-
-    data[default_name] = value
-
-
-def _json_string_or_same(value: Any) -> Any:
-    if isinstance(value, (dict, list)):
-        return json.dumps(value, ensure_ascii=False)
-    return value
-
-
 def _parse_3xui_json_field(value: Any) -> Any:
+    """3x-ui v3 returns JSON objects, older panels may return JSON strings."""
     if isinstance(value, str):
         try:
             return json.loads(value)
@@ -344,70 +89,108 @@ def _parse_3xui_json_field(value: Any) -> Any:
     return value
 
 
+def _inbound_to_raw(inbound: Any) -> dict[str, Any]:
+    raw = _as_dict(inbound)
+
+    for key in ("settings", "streamSettings", "sniffing", "allocate"):
+        if key in raw:
+            raw[key] = _parse_3xui_json_field(raw[key])
+
+    return raw
+
+
+def _get_inbound_settings(inbound: Any) -> dict[str, Any]:
+    inbound_dict = _as_dict(inbound)
+    settings = _parse_3xui_json_field(inbound_dict.get("settings") or {})
+    return settings if isinstance(settings, dict) else {}
+
+
+def _get_clients_from_inbound(inbound: Any) -> list[dict[str, Any]]:
+    settings = _get_inbound_settings(inbound)
+    clients = settings.get("clients") or []
+
+    if not isinstance(clients, list):
+        return []
+
+    result: list[dict[str, Any]] = []
+    for client in clients:
+        client_dict = _as_dict(client)
+        if client_dict:
+            result.append(client_dict)
+
+    return result
+
+
+def _get_client_stats_from_inbound(inbound: Any) -> dict[str, dict[str, int]]:
+    raw = _inbound_to_raw(inbound)
+    stats = raw.get("clientStats") or raw.get("client_stats") or []
+
+    result: dict[str, dict[str, int]] = {}
+    if not isinstance(stats, list):
+        return result
+
+    for stat in stats:
+        stat_dict = _as_dict(stat)
+        email = stat_dict.get("email")
+        if email:
+            result[str(email)] = {
+                "up": int(stat_dict.get("up") or 0),
+                "down": int(stat_dict.get("down") or 0),
+            }
+
+    return result
+
+
+def _client_identity(client: dict[str, Any]) -> str | None:
+    value = client.get("uuid") or client.get("id") or client.get("password") or client.get("auth")
+    return str(value) if value else None
+
+
+def _client_sub_id(client: dict[str, Any]) -> str | None:
+    value = client.get("subId") or client.get("sub_id")
+    return str(value) if value else None
+
+
+def _client_enable(client: dict[str, Any]) -> bool | None:
+    value = client.get("enable", client.get("enabled"))
+    return value if isinstance(value, bool) else None
+
+
+def _client_expiry_time(client: dict[str, Any]) -> int | None:
+    value = client.get("expiryTime", client.get("expiry_time"))
+    return int(value) if value is not None else None
+
+
+def _client_total_gb(client: dict[str, Any]) -> int | None:
+    value = client.get("totalGB", client.get("total_gb"))
+    return int(value) if value is not None else None
+
+
+def _quote_path(value: str) -> str:
+    return quote(value, safe="")
+
+
 class XuiAdapter:
-    """Boundary around 3x-ui.
+    """3x-ui v3 REST API adapter.
 
-    Panel mutations are mostly done via py3xui.
+    This class intentionally keeps the old public methods used by the rest of
+    the backend, but internally talks to 3x-ui directly through HTTP instead of
+    py3xui.
 
-    Important exception:
-    Hysteria/Hysteria2 clients are updated via raw 3x-ui HTTP API,
-    because py3xui typed models may lose settings.clients[].password
-    during inbound serialization.
+    Auth mode:
+      Bearer token only. By default, the adapter uses panel_password from the
+      existing Server model as the 3x-ui v3 API token. panel_username is kept
+      only for compatibility with the current backend model and is not used.
     """
 
     def __init__(self, config: XuiServerConfig):
         self.config = config
 
-    def _api(self):
-        try:
-            from py3xui import Api
-        except ImportError as exc:  # pragma: no cover
-            raise RuntimeError("py3xui is not installed. Run: pip install py3xui") from exc
-
-        try:
-            api = Api(
-                self.config.panel_url,
-                self.config.panel_username,
-                self.config.panel_password,
-                use_tls_verify=self.config.use_tls_verify,
-            )
-        except TypeError:
-            api = Api(
-                self.config.panel_url,
-                self.config.panel_username,
-                self.config.panel_password,
-            )
-
-        api.login()
-        return api
-
     def _panel_url(self, path: str) -> str:
         return self.config.panel_url.rstrip("/") + "/" + path.lstrip("/")
 
-    def _login_http_client(self) -> httpx.Client:
-        client = httpx.Client(
-            timeout=20.0,
-            follow_redirects=True,
-            verify=self.config.use_tls_verify,
-        )
-
-        response = client.post(
-            self._panel_url("/login"),
-            data={
-                "username": self.config.panel_username,
-                "password": self.config.panel_password,
-            },
-        )
-        response.raise_for_status()
-
-        try:
-            payload = response.json()
-            if isinstance(payload, dict) and payload.get("success") is False:
-                raise RuntimeError(payload.get("msg") or "3x-ui login failed")
-        except ValueError:
-            pass
-
-        return client
+    def _public_subscription_url(self, sub_id: str) -> str:
+        return self.config.subscription_base_url.rstrip("/") + f"/{sub_id}"
 
     @staticmethod
     def _extract_3xui_obj(response: httpx.Response) -> Any:
@@ -424,133 +207,110 @@ class XuiAdapter:
 
         return payload
 
-    def _fetch_inbound_raw_via_http(
-        self,
-        client: httpx.Client,
-        inbound_id: int,
-    ) -> dict[str, Any]:
-        response = client.get(self._panel_url(f"/panel/api/inbounds/get/{inbound_id}"))
-        obj = self._extract_3xui_obj(response)
+    def _api_token(self) -> str:
+        token = self.config.api_token or self.config.panel_password
+        token = (token or "").strip()
+        if not token:
+            raise ValueError(
+                "3x-ui API token is empty. Put the 3x-ui v3 API token into "
+                "the server panel_password field."
+            )
+        return token
 
-        if not isinstance(obj, dict):
-            obj = _as_dict(obj)
+    def _auth_headers(self) -> dict[str, str]:
+        return {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {self._api_token()}",
+        }
 
-        for key in ("settings", "streamSettings", "sniffing", "allocate"):
-            if key in obj:
-                obj[key] = _parse_3xui_json_field(obj[key])
-
-        return obj
-
-    def _update_inbound_raw_via_http(
-        self,
-        client: httpx.Client,
-        inbound_id: int,
-        inbound_raw: dict[str, Any],
-    ) -> None:
-        payload: dict[str, Any] = {}
-
-        allowed_keys = (
-            "id",
-            "up",
-            "down",
-            "total",
-            "remark",
-            "enable",
-            "expiryTime",
-            "listen",
-            "port",
-            "protocol",
-            "settings",
-            "streamSettings",
-            "tag",
-            "sniffing",
-            "allocate",
+    def _http_client(self) -> httpx.Client:
+        return httpx.Client(
+            timeout=20.0,
+            follow_redirects=True,
+            verify=self.config.use_tls_verify,
+            headers=self._auth_headers(),
         )
 
-        for key in allowed_keys:
-            if key in inbound_raw:
-                payload[key] = inbound_raw[key]
+    def _login_http_client(self) -> httpx.Client:
+        # Backward-compatible alias used by older maintenance/utility code.
+        # Despite the name, this no longer performs /login.
+        return self._http_client()
 
-        payload["id"] = inbound_id
+    async def _async_http_client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            timeout=20.0,
+            follow_redirects=True,
+            verify=self.config.use_tls_verify,
+            headers=self._auth_headers(),
+        )
 
-        for key in ("settings", "streamSettings", "sniffing", "allocate"):
-            if key in payload:
-                payload[key] = _json_string_or_same(payload[key])
-
-        url = self._panel_url(f"/panel/api/inbounds/update/{inbound_id}")
-
-        last_error: Exception | None = None
-
-        for kwargs in (
-            {"json": payload},
-            {"data": payload},
-        ):
-            try:
-                response = client.post(url, **kwargs)
-                self._extract_3xui_obj(response)
-                return
-            except Exception as exc:  # noqa: BLE001
-                last_error = exc
-
-        raise RuntimeError(f"Failed to update hysteria inbound {inbound_id}: {last_error}")
+    def health_check(self) -> None:
+        client = self._http_client()
+        try:
+            self._extract_3xui_obj(
+                client.get(self._panel_url("/panel/api/server/status"))
+            )
+        finally:
+            client.close()
 
     def list_client_configs(self) -> list[DiscoveredClientConfig]:
+        """Return all inbounds/clients from the panel.
+
+        v3 endpoint used:
+            GET /panel/api/inbounds/list
+
+        The backend still stores one RemoteConfig per inbound/client pair, so we
+        keep the old DiscoveredClientConfig shape.
         """
-        Возвращает список конфигов с сервера.
+        client = self._http_client()
+        try:
+            inbounds = self._extract_3xui_obj(
+                client.get(self._panel_url("/panel/api/inbounds/list"))
+            )
+        finally:
+            client.close()
 
-        Для VLESS/VMess/Trojan:
-          один client = один DiscoveredClientConfig.
+        if not isinstance(inbounds, list):
+            raise RuntimeError("Unexpected 3x-ui /inbounds/list response")
 
-        Для Hysteria/Hysteria2:
-          если в settings.clients есть клиенты, один client = один DiscoveredClientConfig.
-
-        Для inbound-only протоколов:
-          один inbound = один DiscoveredClientConfig с client_uuid=None.
-
-        Трафик client-based конфигов берём из inbound.clientStats,
-        потому что в settings.clients[] up/down часто отсутствуют.
-        """
-        api = self._api()
-        inbounds = api.inbound.get_list()
         discovered: list[DiscoveredClientConfig] = []
 
-        for inbound in inbounds:
-            inbound_id = _get_attr(inbound, "id")
+        for inbound_raw_value in inbounds:
+            inbound = _inbound_to_raw(inbound_raw_value)
+            inbound_id = inbound.get("id")
             if inbound_id is None:
                 continue
 
-            inbound_remark = _get_attr(inbound, "remark")
-            inbound_protocol = _get_attr(inbound, "protocol")
-            inbound_port = _get_attr(inbound, "port")
-            inbound_raw = _inbound_to_raw(inbound)
+            inbound_remark = inbound.get("remark")
+            inbound_protocol = inbound.get("protocol")
+            inbound_port = inbound.get("port")
 
             clients = _get_clients_from_inbound(inbound)
             client_stats = _get_client_stats_from_inbound(inbound)
 
             if clients:
-                for client in clients:
-                    client_uuid = _get_attr(client, "id", "uuid")
-                    client_email = _get_attr(client, "email")
-
+                for client_data in clients:
+                    client_email = client_data.get("email")
+                    client_uuid = _client_identity(client_data)
                     stats = client_stats.get(str(client_email)) if client_email else None
 
                     discovered.append(
                         DiscoveredClientConfig(
                             inbound_id=int(inbound_id),
-                            inbound_remark=inbound_remark,
-                            inbound_protocol=inbound_protocol,
+                            inbound_remark=str(inbound_remark) if inbound_remark is not None else None,
+                            inbound_protocol=str(inbound_protocol) if inbound_protocol is not None else None,
                             inbound_port=int(inbound_port) if inbound_port is not None else None,
-                            client_uuid=str(client_uuid) if client_uuid else None,
+                            client_uuid=client_uuid,
                             client_email=str(client_email) if client_email else None,
-                            client_sub_id=_get_attr(client, "sub_id", "subId"),
-                            client_enable=_get_attr(client, "enable", "enabled"),
-                            client_expiry_time=_get_attr(client, "expiry_time", "expiryTime"),
-                            client_total_gb=_get_attr(client, "total_gb", "totalGB"),
-                            client_up=(stats or {}).get("up", _get_attr(client, "up", default=0)),
-                            client_down=(stats or {}).get("down", _get_attr(client, "down", default=0)),
+                            client_sub_id=_client_sub_id(client_data),
+                            client_enable=_client_enable(client_data),
+                            client_expiry_time=_client_expiry_time(client_data),
+                            client_total_gb=_client_total_gb(client_data),
+                            client_up=(stats or {}).get("up", int(client_data.get("up") or 0)),
+                            client_down=(stats or {}).get("down", int(client_data.get("down") or 0)),
                             raw={
-                                "inbound": inbound_raw,
-                                "client": _as_dict(client),
+                                "inbound": inbound,
+                                "client": client_data,
                                 "client_stats": stats,
                             },
                         )
@@ -561,19 +321,19 @@ class XuiAdapter:
             discovered.append(
                 DiscoveredClientConfig(
                     inbound_id=int(inbound_id),
-                    inbound_remark=inbound_remark,
-                    inbound_protocol=inbound_protocol,
+                    inbound_remark=str(inbound_remark) if inbound_remark is not None else None,
+                    inbound_protocol=str(inbound_protocol) if inbound_protocol is not None else None,
                     inbound_port=int(inbound_port) if inbound_port is not None else None,
                     client_uuid=None,
                     client_email=None,
                     client_sub_id=None,
-                    client_enable=_get_attr(inbound, "enable", "enabled"),
+                    client_enable=inbound.get("enable") if isinstance(inbound.get("enable"), bool) else None,
                     client_expiry_time=None,
                     client_total_gb=None,
-                    client_up=_get_attr(inbound, "up", default=0),
-                    client_down=_get_attr(inbound, "down", default=0),
+                    client_up=int(inbound.get("up") or 0),
+                    client_down=int(inbound.get("down") or 0),
                     raw={
-                        "inbound": inbound_raw,
+                        "inbound": inbound,
                         "client": None,
                     },
                 )
@@ -581,143 +341,24 @@ class XuiAdapter:
 
         return discovered
 
-    def health_check(self) -> None:
-        api = self._api()
-        api.inbound.get_list()
+    def _get_client_by_email(self, client: httpx.Client, client_email: str) -> tuple[dict[str, Any], list[int]]:
+        obj = self._extract_3xui_obj(
+            client.get(self._panel_url(f"/panel/api/clients/get/{_quote_path(client_email)}"))
+        )
 
-    def _update_inbound_object(self, api: Any, inbound_id: int, inbound: Any) -> None:
-        """
-        Разные версии py3xui могут иметь разные сигнатуры inbound.update.
-        Пробуем несколько вариантов.
+        if not isinstance(obj, dict):
+            raise RuntimeError(f"Unexpected 3x-ui client payload for {client_email}")
 
-        Не использовать для Hysteria/Hysteria2 clients,
-        потому что py3xui может потерять settings.clients[].password.
-        """
-        try:
-            api.inbound.update(inbound_id, inbound)
-            return
-        except TypeError:
-            pass
+        client_data = obj.get("client") or obj
+        inbound_ids = obj.get("inboundIds") or obj.get("inbound_ids") or []
 
-        try:
-            api.inbound.update(inbound)
-            return
-        except TypeError:
-            pass
+        if not isinstance(client_data, dict):
+            raise RuntimeError(f"Unexpected 3x-ui client data for {client_email}")
 
-        api.inbound.update(inbound_id, inbound)
+        if not isinstance(inbound_ids, list):
+            inbound_ids = []
 
-    def _set_hysteria_subscription_fields(
-            self,
-            *,
-            inbound_id: int,
-            client_email: str | None,
-            client_uuid: str | None,
-            sub_id: str,
-            expiry_time: int | None,
-            total_gb: int | None,
-            enable: bool | None,
-    ) -> str:
-        """
-        Hysteria/Hysteria2 обновляем только через raw 3x-ui API.
-
-        Почему:
-        password клиента лежит в settings.clients[].password.
-        При обновлении через py3xui object это поле может исчезнуть,
-        после чего 3x-ui начинает отдавать подписки без password.
-
-        Поэтому здесь:
-        - читаем inbound raw;
-        - ищем клиента по uuid/email;
-        - меняем только subId / expiryTime / totalGB / enable;
-        - password и остальные поля не трогаем;
-        - отправляем весь inbound обратно raw payload'ом.
-        """
-        http_client = self._login_http_client()
-
-        try:
-            inbound_raw = self._fetch_inbound_raw_via_http(http_client, inbound_id)
-
-            settings = inbound_raw.get("settings") or {}
-            settings = _parse_3xui_json_field(settings)
-
-            if not isinstance(settings, dict):
-                raise ValueError(f"Inbound {inbound_id} settings is not a dict")
-
-            clients = settings.get("clients") or []
-
-            if not isinstance(clients, list):
-                raise ValueError(f"Inbound {inbound_id} settings.clients is not a list")
-
-            found_client: dict[str, Any] | None = None
-
-            for index, candidate in enumerate(clients):
-                if not isinstance(candidate, dict):
-                    candidate = _as_dict(candidate)
-                    clients[index] = candidate
-
-                candidate_uuid = candidate.get("id") or candidate.get("uuid")
-                candidate_email = candidate.get("email")
-
-                if client_uuid and candidate_uuid and str(candidate_uuid) == str(client_uuid):
-                    found_client = candidate
-                    break
-
-                if client_email and candidate_email and str(candidate_email) == str(client_email):
-                    found_client = candidate
-                    break
-
-            if found_client is None:
-                raise ValueError(
-                    f"Hysteria client not found in inbound {inbound_id}: "
-                    f"email={client_email!r}, uuid={client_uuid!r}"
-                )
-
-            _set_dict_alias(
-                found_client,
-                ("subId", "sub_id"),
-                sub_id,
-                default_name="subId",
-            )
-
-            if expiry_time is not None:
-                _set_dict_alias(
-                    found_client,
-                    ("expiryTime", "expiry_time"),
-                    expiry_time,
-                    default_name="expiryTime",
-                )
-
-            if total_gb is not None:
-                _set_dict_alias(
-                    found_client,
-                    ("totalGB", "total_gb"),
-                    total_gb,
-                    default_name="totalGB",
-                )
-
-            if enable is not None:
-                _set_dict_alias(
-                    found_client,
-                    ("enable", "enabled"),
-                    enable,
-                    default_name="enable",
-                )
-
-            settings["clients"] = clients
-            inbound_raw["settings"] = settings
-
-            self._update_inbound_raw_via_http(
-                http_client,
-                inbound_id,
-                inbound_raw,
-            )
-
-            effective_uuid = found_client.get("id") or found_client.get("uuid")
-            return str(effective_uuid or "")
-
-        finally:
-            http_client.close()
+        return deepcopy(client_data), [int(item) for item in inbound_ids]
 
     def set_client_subscription_fields(
         self,
@@ -732,92 +373,64 @@ class XuiAdapter:
     ) -> str:
         """Set subId plus optional expiry/traffic/enabled fields.
 
-        VLESS/VMess/Trojan:
-          обновляем через api.client.update()
+        v3 endpoint used:
+            GET  /panel/api/clients/get/:email
+            POST /panel/api/clients/update/:email
 
-        Hysteria/Hysteria2:
-          обновляем через raw inbound update, чтобы не потерять password.
+        3x-ui v3 treats clients as first-class entities, identified by email.
+        The update endpoint replaces the client row, so this method first reads
+        the full client payload and then changes only the fields managed by this
+        central backend.
         """
-        if not client_email and not client_uuid:
-            raise ValueError("client_email or client_uuid is required")
+        if not client_email:
+            raise ValueError("3x-ui v3 client update requires client_email")
 
-        api = self._api()
-        inbound = api.inbound.get_by_id(inbound_id)
+        client = self._http_client()
+        try:
+            client_data, inbound_ids = self._get_client_by_email(client, client_email)
 
-        inbound_protocol = str(_get_attr(inbound, "protocol", default="") or "").lower()
+            if client_uuid:
+                current_identity = _client_identity(client_data)
+                # Do not fail on password-based protocols where the central DB may
+                # store password/auth instead of uuid. This check is only a guard
+                # against obviously wrong updates when both sides expose a UUID.
+                if current_identity and str(current_identity) != str(client_uuid):
+                    raw_id = client_data.get("id") or client_data.get("uuid")
+                    if raw_id and str(raw_id) != str(client_uuid):
+                        raise ValueError(
+                            f"Client identity mismatch for {client_email}: "
+                            f"panel={raw_id!r}, expected={client_uuid!r}"
+                        )
 
-        if inbound_protocol in {"hysteria", "hysteria2", "hy2"}:
-            return self._set_hysteria_subscription_fields(
-                inbound_id=inbound_id,
-                client_email=client_email,
-                client_uuid=client_uuid,
-                sub_id=sub_id,
-                expiry_time=expiry_time,
-                total_gb=total_gb,
-                enable=enable,
+            payload = deepcopy(client_data)
+            payload["email"] = client_email
+            payload["subId"] = sub_id
+
+            if expiry_time is not None:
+                payload["expiryTime"] = expiry_time
+
+            if total_gb is not None:
+                payload["totalGB"] = total_gb
+
+            if enable is not None:
+                payload["enable"] = enable
+
+            # Some 3x-ui builds ignore this on update, some accept it. Keeping it
+            # prevents accidental detach if a build expects the field.
+            if inbound_ids:
+                payload["inboundIds"] = inbound_ids
+
+            self._extract_3xui_obj(
+                client.post(
+                    self._panel_url(f"/panel/api/clients/update/{_quote_path(client_email)}"),
+                    json=payload,
+                )
             )
 
-        clients = _get_clients_from_inbound(inbound)
+            return str(payload.get("uuid") or payload.get("id") or client_uuid or client_email)
 
-        inbound_client = _find_client(
-            clients,
-            client_email=client_email,
-            client_uuid=client_uuid,
-        )
-
-        if inbound_client is None:
-            raise ValueError(
-                f"Client not found in inbound {inbound_id}: "
-                f"email={client_email!r}, uuid={client_uuid!r}"
-            )
-
-        raw_uuid = _get_attr(inbound_client, "id", "uuid")
-        effective_uuid = str(raw_uuid) if raw_uuid else ""
-
-        update_key = effective_uuid or client_email
-
-        if not update_key:
-            raise ValueError(
-                f"Cannot update client in inbound {inbound_id}: no uuid and no email"
-            )
-
-        update_client = None
-
-        if client_email:
-            try:
-                update_client = api.client.get_by_email(client_email)
-            except Exception:
-                update_client = None
-
-        if update_client is None:
-            raise ValueError(
-                f"Cannot load py3xui client object for update: "
-                f"email={client_email!r}, uuid={effective_uuid!r}"
-            )
-
-        inbound_flow = _get_attr(inbound_client, "flow")
-        update_flow = _get_attr(update_client, "flow")
-
-        if inbound_flow and not update_flow:
-            _set_existing_or_first_attr(update_client, ("flow",), inbound_flow)
-
-        if effective_uuid:
-            _set_existing_or_first_attr(update_client, ("id", "uuid"), effective_uuid)
-
-        _set_existing_or_first_attr(update_client, ("sub_id", "subId"), sub_id)
-
-        if expiry_time is not None:
-            _set_existing_or_first_attr(update_client, ("expiry_time", "expiryTime"), expiry_time)
-
-        if total_gb is not None:
-            _set_existing_or_first_attr(update_client, ("total_gb", "totalGB"), total_gb)
-
-        if enable is not None:
-            _set_existing_or_first_attr(update_client, ("enable", "enabled"), enable)
-
-        api.client.update(update_key, update_client)
-
-        return effective_uuid or str(client_email)
+        finally:
+            client.close()
 
     def set_client_sub_id(
         self,
@@ -833,37 +446,6 @@ class XuiAdapter:
             client_uuid=client_uuid,
             sub_id=sub_id,
         )
-
-    async def fetch_subscription_links_with_raw(
-        self,
-        sub_id: str,
-        *,
-        prefix: str | None = None,
-    ) -> tuple[list[str], str]:
-        url = self.config.subscription_base_url.rstrip("/") + f"/{sub_id}"
-
-        async with httpx.AsyncClient(
-            timeout=15.0,
-            follow_redirects=True,
-            verify=self.config.use_tls_verify,
-        ) as client:
-            response = await client.get(url)
-            response.raise_for_status()
-
-        raw = response.text
-        return normalize_links(raw, prefix=prefix), raw
-
-    async def fetch_subscription_links(
-        self,
-        sub_id: str,
-        *,
-        prefix: str | None = None,
-    ) -> list[str]:
-        links, _raw = await self.fetch_subscription_links_with_raw(
-            sub_id,
-            prefix=prefix,
-        )
-        return links
 
     def clear_client_sub_id(
         self,
@@ -882,31 +464,117 @@ class XuiAdapter:
             enable=None,
         )
 
-    def reset_all_client_traffics(self) -> list[int]:
-        api = self._api()
-        inbound_ids: list[int] = []
+    async def fetch_subscription_links_with_raw(
+        self,
+        sub_id: str,
+        *,
+        prefix: str | None = None,
+    ) -> tuple[list[str], str]:
+        """Fetch subscription links for a subId.
 
-        for inbound in api.inbound.get_list():
-            inbound_id = _get_attr(inbound, "id")
-            if inbound_id is not None:
-                inbound_ids.append(int(inbound_id))
+        Primary v3 endpoint:
+            GET /panel/api/clients/subLinks/:subId
 
-        client = self._login_http_client()
+        Fallback:
+            public subscription_base_url/<subId>
+        """
+        api_error: Exception | None = None
+
         try:
-            for inbound_id in inbound_ids:
-                response = client.post(
-                    self._panel_url(f"/panel/api/inbounds/resetAllClientTraffics/{inbound_id}")
+            client = await self._async_http_client()
+            try:
+                response = await client.get(
+                    self._panel_url(f"/panel/api/clients/subLinks/{_quote_path(sub_id)}")
                 )
-                self._extract_3xui_obj(response)
+                obj = self._extract_3xui_obj(response)
+
+                if not isinstance(obj, list):
+                    raise RuntimeError("Unexpected 3x-ui subLinks response")
+
+                links = [str(item).strip() for item in obj if str(item).strip()]
+                raw = json.dumps(obj, ensure_ascii=False)
+
+                if prefix:
+                    links = normalize_links("\n".join(links), prefix=prefix)
+
+                return links, raw
+            finally:
+                await client.aclose()
+        except Exception as exc:  # noqa: BLE001
+            api_error = exc
+
+        # Keep the old public-subscription fallback so this file can be deployed
+        # before every remote panel/token is fully migrated.
+        async with httpx.AsyncClient(
+            timeout=15.0,
+            follow_redirects=True,
+            verify=self.config.use_tls_verify,
+        ) as public_client:
+            try:
+                response = await public_client.get(self._public_subscription_url(sub_id))
+                response.raise_for_status()
+            except Exception as fallback_exc:  # noqa: BLE001
+                raise RuntimeError(
+                    f"Failed to fetch subscription links via v3 API ({api_error}) "
+                    f"and public subscription fallback ({fallback_exc})"
+                ) from fallback_exc
+
+        raw = response.text
+        return normalize_links(raw, prefix=prefix), raw
+
+    async def fetch_subscription_links(
+        self,
+        sub_id: str,
+        *,
+        prefix: str | None = None,
+    ) -> list[str]:
+        links, _raw = await self.fetch_subscription_links_with_raw(
+            sub_id,
+            prefix=prefix,
+        )
+        return links
+
+    def reset_all_client_traffics(self) -> None:
+        """Reset all per-client traffic counters on the panel."""
+        client = self._http_client()
+        try:
+            self._extract_3xui_obj(
+                client.post(self._panel_url("/panel/api/clients/resetAllTraffics"))
+            )
         finally:
             client.close()
-
-        return inbound_ids
 
     def reset_all_panel_traffics(self) -> None:
-        client = self._login_http_client()
+        """Reset inbound-level traffic counters on the panel."""
+        client = self._http_client()
         try:
-            response = client.post(self._panel_url("/panel/api/inbounds/resetAllTraffics"))
-            self._extract_3xui_obj(response)
+            self._extract_3xui_obj(
+                client.post(self._panel_url("/panel/api/inbounds/resetAllTraffics"))
+            )
         finally:
             client.close()
+
+    def reset_client_traffic(self, *, client_email: str) -> None:
+        """Reset one client's traffic counters by email."""
+        client = self._http_client()
+        try:
+            self._extract_3xui_obj(
+                client.post(self._panel_url(f"/panel/api/clients/resetTraffic/{_quote_path(client_email)}"))
+            )
+        finally:
+            client.close()
+
+    def get_client_links(self, *, client_email: str) -> list[str]:
+        """Return all protocol URLs for one client across attached inbounds."""
+        client = self._http_client()
+        try:
+            obj = self._extract_3xui_obj(
+                client.get(self._panel_url(f"/panel/api/clients/links/{_quote_path(client_email)}"))
+            )
+        finally:
+            client.close()
+
+        if not isinstance(obj, list):
+            raise RuntimeError("Unexpected 3x-ui client links response")
+
+        return [str(item).strip() for item in obj if str(item).strip()]

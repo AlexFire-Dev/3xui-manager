@@ -82,12 +82,41 @@ if [ "$HTTP_CODE" != "200" ]; then
   exit 1
 fi
 
-VLESS_URL="$(tr -d '\r' < "$SUB_FILE" | sed -n '/^vless:\/\//{p;q;}')"
+DECODED_SUB_FILE="$TMP_DIR/sub.decoded.txt"
+
+# 1) Сначала пробуем как plain-text subscription
+if tr -d '\r' < "$SUB_FILE" | grep -q '^vless://'; then
+  tr -d '\r' < "$SUB_FILE" > "$DECODED_SUB_FILE"
+
+# 2) Если не нашли vless://, пробуем декодировать как base64 subscription
+else
+  echo "No plain vless:// found, trying base64 decode..."
+
+  if ! command -v base64 >/dev/null 2>&1; then
+    echo "ERROR: base64 not found"
+    echo "Install: opkg update && opkg install coreutils-base64"
+    exit 1
+  fi
+
+  # Подписки часто приходят одной base64-строкой, но на всякий случай убираем CR/LF.
+  if ! tr -d '\r\n ' < "$SUB_FILE" | base64 -d > "$DECODED_SUB_FILE" 2>/dev/null; then
+    echo "ERROR: failed to decode subscription as base64"
+    echo "Raw subscription response:"
+    cat "$SUB_FILE"
+    echo
+    exit 1
+  fi
+fi
+
+VLESS_URL="$(tr -d '\r' < "$DECODED_SUB_FILE" | sed -n '/^vless:\/\//{p;q;}')"
 
 if [ -z "$VLESS_URL" ]; then
-  echo "ERROR: no vless:// URL found in subscription response"
-  echo "Subscription response:"
+  echo "ERROR: no vless:// URL found in decoded subscription"
+  echo "Raw subscription response:"
   cat "$SUB_FILE"
+  echo
+  echo "Decoded subscription response:"
+  cat "$DECODED_SUB_FILE" || true
   echo
   exit 1
 fi
